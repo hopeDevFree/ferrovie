@@ -1,0 +1,9 @@
+url_normalize
+tgcrypto
+bs4
+lxml
+APScheduler
+httpx[http2]
+pyrogram
+telegraph
+requests_html
