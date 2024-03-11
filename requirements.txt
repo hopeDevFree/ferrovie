@@ -6,4 +6,6 @@ APScheduler
 httpx[http2]
 pyrogram
 telegraph
-requests_html
+selenium
+python-dotenv
+Flask

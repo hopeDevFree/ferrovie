@@ -6,12 +6,14 @@ from telegraph import Telegraph
 from url_normalize import url_normalize
 import tgcrypto
 import os
+from dotenv import load_dotenv
 import ssl
 import certifi
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
-from requests_html import AsyncHTMLSession
+from selenium import webdriver
+from keep_alive import keep_alive
 
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
@@ -22,7 +24,15 @@ def start():
 
 scheduler = AsyncIOScheduler(timezone="Europe/Rome")
 
+options = webdriver.ChromeOptions()
+options.add_argument("--headless")
+options.add_argument("--disable-gpu")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+
 telegraph = Telegraph()
+
+load_dotenv()
 
 api_id_importato = os.environ['api_id']
 api_hash_importato = os.environ['api_hash']
@@ -1251,17 +1261,19 @@ def elimina(telegram, message):
 async def scraping():
     print("entrato scraping")
 
-    session = AsyncHTMLSession()
+    driver = webdriver.Chrome(options)
 
-    response = await session.get(DOMAIN + "jobs.php")
+    driver.get(DOMAIN + "jobs.php")
+    driver.implicitly_wait(10)
 
-    await response.html.arender()
+    driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
+    driver.refresh()
+
+    html = driver.page_source
 
     print("dopo aver aspettato scraping")
 
-    soup = BeautifulSoup(response.text, "lxml")
-
-    print(soup)
+    soup = BeautifulSoup(html, "lxml")
 
     results = soup.find("div", {
         "class": "searchResultsBody"
@@ -1283,16 +1295,19 @@ async def scraping():
 
         lista_posizione = [
             span.text.strip().title() for span in details.find_next(
-                text="Sede:").find_next("td").find_next("span").find_all("span")
+                string="Sede:").find_next("td").find_next("span").find_all("span")
             if span.text.strip()
         ]
 
         data["zone"] = ' , '.join(lista_posizione)
 
-        responseannuncio = httpx.get(data['url'],
-                                     cookies={'lang': 'it_IT'},
-                                     timeout=10.0)
-        soupannuncio = BeautifulSoup(responseannuncio.text, 'lxml')
+        driver.get(data['url'])
+        driver.implicitly_wait(10)
+        driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
+        driver.refresh()
+        responseannuncio = driver.page_source
+
+        soupannuncio = BeautifulSoup(responseannuncio, 'lxml')
 
         try:
 
@@ -1306,8 +1321,8 @@ async def scraping():
             }).text.strip()
         data["descrizione"] = descrizione
 
-        data["sector"] = details.find_next(text="Settore:").find_next("span").text
-        data["role"] = details.find_next(text="Ruolo:").find_next("span").text
+        data["sector"] = details.find_next(string="Settore:").find_next("span").text
+        data["role"] = details.find_next(string="Ruolo:").find_next("span").text
         data["day"], data["month"], data["year"] = map(
             int,
             details.find("span", {
@@ -1440,6 +1455,8 @@ async def scraping():
                         except:
                             print("non inviato perchè bloccato")
 
+    driver.quit()
+
 
 async def clean():
     print("entrato pulizia")
@@ -1499,14 +1516,14 @@ telegram.start()
 scheduler.add_job(clean,
                   "interval",
                   hours=12,
-                  misfire_grace_time=None,
-                  next_run_time=datetime.now() + timedelta(seconds=15))
+                  next_run_time=datetime.now() + timedelta(seconds=2))
 scheduler.add_job(scraping,
                   "interval",
                   minutes=5,
-                  misfire_grace_time=None,
-                  next_run_time=datetime.now() + timedelta(seconds=5))
+                  next_run_time=datetime.now() + timedelta(seconds=55))
 
 scheduler.start()
+
+keep_alive()
 
 idle()
