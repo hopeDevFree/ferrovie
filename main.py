@@ -643,11 +643,11 @@ Pagina {page_number}/{max_page}\n\n"""
 
             if page_number == 1:
                 cur.execute("SELECT * FROM jobs WHERE zone LIKE %s LIMIT 10",
-                            (f"%{CallbackQuery.data.split("/")[2]}%",))
+                            (f"%{zone}%",))
 
             else:
                 cur.execute("SELECT * FROM jobs WHERE zone LIKE %s OFFSET %s LIMIT 10",
-                            (f"%{CallbackQuery.data.split("/")[2]}%", ((page_number - 1) * 10)))
+                            (f"%{zone}%", ((page_number - 1) * 10)))
 
             messaggio = f"""Questi sono i risultati per <b>{zone}</b>:\n
 Totale: <b>{counter_zone[0]}</b>.
