@@ -3,9 +3,9 @@ tgcrypto
 bs4
 lxml
 APScheduler
-httpx[http2]
-pyrogram
+git+https://github.com/KurimuzonAkuma/pyrogram.git@v2.1.17
 telegraph
 selenium
 python-dotenv
 Flask
+psycopg2
