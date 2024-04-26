@@ -816,26 +816,42 @@ async def scraping():
                     + jobTitle.replace(' ', '+') + "+" + sentMessage.link))
             ])
 
-            message_edited = await app.edit_message_reply_markup(CHAT_ID, sentMessage.id,
-                                                                 InlineKeyboardMarkup(annunciobuttons))
+            message_edited = await app.edit_message_reply_markup(chat_id=CHAT_ID, message_id=sentMessage.id,
+                                                                 reply_markup=InlineKeyboardMarkup(annunciobuttons))
 
             cur.execute(
-                "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values (%s, %s, %s, %s, %s, "
+                "%s, %s, %s)",
                 (jobID, dateDB, jobUrl, jobTitle, jobZone, jobRole, jobSector, sentMessage.id))
 
-            cur.execute("SELECT * FROM users JOIN sectors ON users.id = sectors.iduser "
-                        "JOIN notifications ON users.id = notifications.iduser "
-                        "JOIN zones ON users.id = zones.iduser "
-                        "WHERE sectors.type = %s AND notifications.type = 'new' AND zones.zone IN %s",
-                        (jobSector, tuple(lista_posizione)))
+            cur.execute("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
+            users = cur.fetchall()
+            for user in users:
+                cur.execute("SELECT type FROM sectors WHERE idUser = %s", (user[0],))
+                user_sectors = cur.fetchall()
+                cur.execute("SELECT zone FROM zones WHERE idUser = %s", (user[0],))
+                user_zones = cur.fetchall()
 
-            for user in cur.fetchall():
-                try:
-                    await app.forward_messages(chat_id=user[0],
-                                               from_chat_id=CHAT_ID,
-                                               message_ids=message_edited.id)
-                except:
-                    users_blocked.append(user[0])
+                send = False
+                if user_zones and user_sectors:
+                    if jobSector in [sector[0] for sector in user_sectors] and any(
+                            zone[0] in jobZone for zone in user_zones):
+                        send = True
+                elif user_zones:
+                    if any(zone[0] in jobZone for zone in user_zones):
+                        send = True
+                elif user_sectors:
+                    if jobSector in [sector[0] for sector in user_sectors]:
+                        send = True
+                else:
+                    send = True
+                if send:
+                    try:
+                        await app.forward_messages(chat_id=user[0],
+                                                   from_chat_id=CHAT_ID,
+                                                   message_ids=message_edited.id)
+                    except:
+                        users_blocked.append(user[0])
 
     if len(users_blocked) > 0:
         cur.execute("DELETE FROM favorites WHERE idUser IN %s", (tuple(users_blocked),))
@@ -846,7 +862,7 @@ async def scraping():
 
     conn.commit()
     driver.quit()
-
+    await app.send_message(chat_id=5453376840, text="Finito scrape")
     print("finish scrape")
 
 
@@ -885,7 +901,7 @@ async def clean():
 
 app.start()
 scheduler.add_job(clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
-scheduler.add_job(scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=50))
+scheduler.add_job(scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
 idle()
