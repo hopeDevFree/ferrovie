@@ -896,7 +896,7 @@ async def clean():
 
 
 app.start()
-scheduler.add_job(clean, "cron", hours=1, next_run_time=datetime.now() + timedelta(seconds=30))
+scheduler.add_job(clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
 scheduler.add_job(scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
