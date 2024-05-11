@@ -694,7 +694,6 @@ async def elimina(app, message):
 
 # Scraping
 async def scraping():
-    print("start scrape")
 
     cur = conn.cursor()
     users_blocked = []
@@ -749,14 +748,18 @@ async def scraping():
 
         dateDB = datetime.strptime(jobDate, '%d/%m/%Y').strftime('%Y-%m-%d')
 
-        cur.execute("SELECT * FROM jobs WHERE url = %s", (jobUrl,))
+        parsed_url = urlparse(jobUrl)
+        params = parse_qs(parsed_url.query)
+        jobID = params['id'][0]
+
+        cur.execute("SELECT * FROM jobs WHERE id = %s", (jobID,))
         jobDB = cur.fetchone()
 
         if jobDB is not None:
             if str(jobDB[1]) != str(dateDB):
                 cur.execute(
-                    "UPDATE jobs SET date = %s, sector = %s, role = %s, zone = %s, title = %s WHERE url = %s",
-                    (dateDB, jobSector, jobRole, jobZone, jobTitle, jobUrl))
+                    "UPDATE jobs SET date = %s, sector = %s, role = %s, zone = %s, title = %s WHERE id = %s",
+                    (dateDB, jobSector, jobRole, jobZone, jobTitle, jobID))
 
                 aggiornobuttons = [[
                     InlineKeyboardButton('Visualizza messaggio 🔗', url=f"t.me/concorsiferrovie/{jobDB[7]}"),
@@ -777,9 +780,7 @@ async def scraping():
             telegraph.create_account("@ConcorsiFerrovie")
             response = telegraph.create_page(f'{jobTitle}',
                                              html_content=f'<p>{jobDescription}</p>')
-            parsed_url = urlparse(jobUrl)
-            params = parse_qs(parsed_url.query)
-            jobID = params['id'][0]
+
             annunciobuttons = [[
                 InlineKeyboardButton(
                     'Condividi il canale ❗',
@@ -852,7 +853,7 @@ async def scraping():
                                                    message_ids=message_edited.id)
                     except:
                         users_blocked.append(user[0])
-
+        conn.commit()
     if len(users_blocked) > 0:
         cur.execute("DELETE FROM favorites WHERE idUser IN %s", (tuple(users_blocked),))
         cur.execute("DELETE FROM sectors WHERE idUser IN %s", (tuple(users_blocked),))
@@ -863,13 +864,10 @@ async def scraping():
     conn.commit()
     driver.quit()
     await app.send_message(chat_id=5453376840, text="Finito scrape")
-    print("finish scrape")
 
 
 # Pulizia Annunci Scaduti
 async def clean():
-    print("start clean")
-
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM jobs")
     jobs = cursor.fetchall()
@@ -886,7 +884,7 @@ async def clean():
         driver.implicitly_wait(10)
         soup = BeautifulSoup(driver.page_source, "lxml")
 
-        if soup.find("h1", {"class": "title"}) is None:
+        if soup.find("div", {"class": "searchTitle"}) is not None:
             delete_list.append(job[0])
 
     if len(delete_list) > 0:
@@ -896,11 +894,9 @@ async def clean():
     driver.quit()
     conn.commit()
 
-    print("finish clean")
-
 
 app.start()
-scheduler.add_job(clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
+scheduler.add_job(clean, "cron", hours=1, next_run_time=datetime.now() + timedelta(seconds=30))
 scheduler.add_job(scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
