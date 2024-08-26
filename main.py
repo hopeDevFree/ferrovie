@@ -104,9 +104,9 @@ Se l'annuncio è disponibile sul sito, ti invitiamo a contattare <b>l'assistenza
                 if jobFavorite is not None:
                     await message.reply(
                         text=f"""❓ <b>Annuncio già aggiunto!</b>
-    
+
 ➤ <a href='{job[2]}'> {job[3]} </a> | 🔗
-    
+
 Digita il pulsante sottostante per accedere al tuo <b>Profilo 👤</b>""",
                         reply_markup=InlineKeyboardMarkup(bottoni_link),
                         disable_web_page_preview=True)
@@ -114,9 +114,9 @@ Digita il pulsante sottostante per accedere al tuo <b>Profilo 👤</b>""",
                     cur.execute("INSERT INTO favorites(idUser, idJob) values (%s, %s)", (message.chat.id, request[1]))
                     await message.reply(
                         text=f"""✔ <b>Annuncio salvato correttamente!</b>
-    
+
 ➤ <a href='{job[2]}'> {job[3]} </a> | 🔗
-    
+
 Potrai visualizzare questo e gli altri nel tuo <b>Profilo 👤</b>""",
                         reply_markup=InlineKeyboardMarkup(bottoni_link),
                         disable_web_page_preview=True)
@@ -127,18 +127,18 @@ Potrai visualizzare questo e gli altri nel tuo <b>Profilo 👤</b>""",
                     cur.execute("DELETE FROM favorites WHERE idUser = %s AND idJob = %s", (message.chat.id, request[1]))
                     await message.reply(
                         text=f"""❌ <b>Annuncio rimosso!</b>
-    
+
 ➤ <a href='{job[2]}'> {job[3]} </a> | 🔗
-    
+
 Questo annuncio non sarà più visualizzabile nel <b>Profilo 👤</b>""",
                         reply_markup=InlineKeyboardMarkup(bottoni_link),
                         disable_web_page_preview=True)
                 else:
                     await message.reply(
                         text=f"""❓ <b>Annuncio non presente!</b>
-    
+
 ➤ <a href='{job[2]}'> {job[3]} </a> | 🔗
-    
+
 Potrai visualizzare gli altri nel tuo <b>Profilo 👤</b> o aggiungerli dal canale <b> @concorsiferrovie </b>""",
                         reply_markup=InlineKeyboardMarkup(bottoni_link),
                         disable_web_page_preview=True)
@@ -332,7 +332,7 @@ I prossimi annunci verranno inviati direttamente in questa chat!""",
             else:
                 CallbackQuery.edit_message_text(
                     text="""😢 <b>Ci dispiace...</b>
-    
+
 Non ci sono annunci con i <b>filtri</b> applicati.""",
                     reply_markup=InlineKeyboardMarkup(pulsanti),
                     disable_web_page_preview=True)
@@ -353,9 +353,9 @@ Non ci sono annunci con i <b>filtri</b> applicati.""",
                        [InlineKeyboardButton('Indietro ↩', callback_data="profilo")]]
 
             testo = f"""📣 Scegli quali filtri applicare agli annunci da <b>notificare!</b>
-    
+
 Pagina <b>{paginattuale}/5.</b>
-    
+
 Cliccando su <b>Avanti</b> potrai passare alle pagine successive, per selezionare <i>settori</i>, <i>regioni</i> e altri campi di tuo interesse!"""
 
         if numeromassimo > paginattuale > 1:
@@ -694,17 +694,27 @@ async def elimina(app, message):
 
 # Scraping
 async def scraping():
-
     cur = conn.cursor()
     users_blocked = []
     driver = webdriver.Chrome(options)
 
     driver.get(DOMAIN + "jobs.php")
+
     driver.implicitly_wait(10)
 
-    driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
-    driver.refresh()
+    driver.delete_cookie('lang')
 
+    driver.add_cookie({
+        'name': 'lang',
+        'value': 'it_IT',
+        'domain': '.fscareers.gruppofs.it',  # Assicurati di usare il dominio corretto
+        'path': '/',
+        'secure': True,
+        'httpOnly': True,
+        'sameSite': 'None'
+    })
+
+    driver.refresh()
     soup = BeautifulSoup(driver.page_source, "lxml")
 
     results = soup.find("div", {
