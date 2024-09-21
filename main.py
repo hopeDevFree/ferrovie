@@ -66,7 +66,7 @@ async def start_command(app, message):
             host=os.environ["db_host"],
             user=os.environ["db_user"],
             password=os.environ["db_password"],
-            port="5432"
+            port=os.environ["db_port"]
     )) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE id = %s", (message.chat.id,))
@@ -202,7 +202,7 @@ async def controlla(app, message):
             host=os.environ["db_host"],
             user=os.environ["db_user"],
             password=os.environ["db_password"],
-            port="5432"
+            port=os.environ["db_port"]
     )) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM jobs WHERE LOWER(url) LIKE %s OR LOWER(title) LIKE %s OR "
@@ -241,7 +241,7 @@ def callback_query(app, CallbackQuery):
             host=os.environ["db_host"],
             user=os.environ["db_user"],
             password=os.environ["db_password"],
-            port="5432"
+            port=os.environ["db_port"]
     )) as conn:
         with conn.cursor() as cur:
 
@@ -731,7 +731,7 @@ async def scraping():
             host=os.environ["db_host"],
             user=os.environ["db_user"],
             password=os.environ["db_password"],
-            port="5432"
+            port=os.environ["db_port"]
     )) as conn:
         with conn.cursor() as cur:
             users_blocked = []
@@ -923,7 +923,7 @@ async def clean():
             host=os.environ["db_host"],
             user=os.environ["db_user"],
             password=os.environ["db_password"],
-            port="5432"
+            port=os.environ["db_port"]
     )) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM jobs")
