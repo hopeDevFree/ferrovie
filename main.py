@@ -1,7 +1,8 @@
+import asyncio
 import math
 from contextlib import closing
 
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from telegraph import Telegraph
 from url_normalize import url_normalize
@@ -29,6 +30,8 @@ options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 
 telegraph = Telegraph()
+
+lock = asyncio.Lock()
 
 load_dotenv()
 
@@ -954,9 +957,18 @@ async def clean():
     await app.send_message(chat_id=5453376840, text="Finito clean")
 
 
-app.start()
-scheduler.add_job(clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
-scheduler.add_job(scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
+async def safe_clean():
+    async with lock:
+        await clean()
+
+
+async def safe_scraping():
+    async with lock:
+        await scraping()
+
+
+scheduler.add_job(safe_clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
+scheduler.add_job(safe_scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
-idle()
+app.run()
