@@ -2,7 +2,7 @@ import asyncio
 import math
 from contextlib import closing
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from telegraph import Telegraph
 from url_normalize import url_normalize
@@ -967,8 +967,9 @@ async def safe_scraping():
         await scraping()
 
 
+app.start()
 scheduler.add_job(safe_clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
 scheduler.add_job(safe_scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
-app.run()
+idle()
