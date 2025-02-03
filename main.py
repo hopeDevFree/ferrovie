@@ -21,8 +21,6 @@ from urllib.parse import urlparse, parse_qs
 
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
-scheduler = AsyncIOScheduler(timezone="Europe/Rome")
-
 options = webdriver.ChromeOptions()
 options.add_argument("--headless")
 options.add_argument("--disable-gpu")
@@ -967,9 +965,10 @@ async def safe_scraping():
         await scraping()
 
 
-app.start()
+loop = asyncio.get_event_loop()
+scheduler = AsyncIOScheduler(timezone="Europe/Rome", event_loop=loop)
 scheduler.add_job(safe_clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
 scheduler.add_job(safe_scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
-idle()
+app.run()
