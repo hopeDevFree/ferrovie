@@ -1,0 +1,26 @@
+# Escludi file Python generati
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ambiente virtuale
+venv/
+.env
+
+# Log e file temporanei
+*.log
+*.tmp
+
+# Configurazioni locali
+.idea/
+.vscode/
+
+# Docker
+*.tar
+*.container
+*.pid
+
+# Evita che i dati di Selenium vengano committati
+chromedriver
+chromedriver_linux64.zip
