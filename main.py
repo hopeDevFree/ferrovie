@@ -15,6 +15,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
 from keep_alive import keep_alive
 import psycopg2
 from urllib.parse import urlparse, parse_qs
@@ -176,19 +179,19 @@ async def candidatura(app, message):
 
 
 # Contatto dell'assistenzza
-@app.on_message(filters.text & filters.private & filters.reply & ~filters.user(5453376840))
+@app.on_message(filters.text & filters.private & filters.reply & ~filters.user(5239432590))
 async def contatta(app, message):
     await message.reply_text(
         "🚄 Ciao! Il tuo messaggio è stato inviato <b>correttamente</b>.\n\nRiceverai una risposta appena possibile.")
 
-    sent = await message.forward(5453376840)
-    await app.send_message(chat_id=5453376840,
+    sent = await message.forward(5239432590)
+    await app.send_message(chat_id=5239432590,
                            text=str(message.chat.id) + " ha inviato un messaggio ❗",
                            reply_to_message_id=sent.id)
 
 
 # Risposta da parte del supporto
-@app.on_message(filters.text & filters.private & filters.user(5453376840) & filters.reply)
+@app.on_message(filters.text & filters.private & filters.user(5239432590) & filters.reply)
 async def rispondi(app, message):
     await app.send_message(message.reply_to_message.text.split(" ")[0], message.text)
 
@@ -755,6 +758,18 @@ async def scraping():
             })
 
             driver.refresh()
+
+            try:
+                wait = WebDriverWait(driver, 20)  # Aspetta max 20 secondi
+                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "searchResultsBody")))
+
+                # Aspetta anche che ci siano dei risultati dentro
+                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "singleResult")))
+
+
+            except Exception as e:
+                print(f"Timeout: elementi non trovati - {e}")
+
             soup = BeautifulSoup(driver.page_source, "lxml")
 
             results = soup.find("div", {
@@ -762,6 +777,7 @@ async def scraping():
             }).find_all("div", {"class": "singleResult responsiveOnly"})
 
             for result in results:
+
                 details = result.find("div", {"class": "details"})
 
                 jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
@@ -780,12 +796,19 @@ async def scraping():
                 driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
                 driver.refresh()
 
+                print(driver.page_source)
+
                 soupannuncio = BeautifulSoup(driver.page_source, 'lxml')
 
                 try:
-                    jobDescription = soupannuncio.find("div", {
+                    description = soupannuncio.find("div", {
                         "itemprop": "description"
-                    }).text.strip()
+                    })
+                    if description is None:
+                        description = soupannuncio.find("div", {
+                            "class": "descriptionContainer"})
+
+                    jobDescription = description.text.strip()
                 except:
                     jobDescription = soupannuncio.find("div", {
                         "class": "locationList"
@@ -914,7 +937,7 @@ async def scraping():
 
             conn.commit()
     driver.quit()
-    await app.send_message(chat_id=5453376840, text="Finito scrape")
+    await app.send_message(chat_id=5239432590, text="Finito scrape")
 
 
 # Pulizia Annunci Scaduti
@@ -952,7 +975,7 @@ async def clean():
             conn.commit()
 
     driver.quit()
-    await app.send_message(chat_id=5453376840, text="Finito clean")
+    await app.send_message(chat_id=5239432590, text="Finito clean")
 
 
 async def safe_clean():
