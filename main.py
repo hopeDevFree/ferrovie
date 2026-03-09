@@ -21,6 +21,7 @@ from selenium.webdriver.common.by import By
 from keep_alive import keep_alive
 import psycopg2
 from urllib.parse import urlparse, parse_qs
+import requests as req_http
 
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
@@ -237,7 +238,7 @@ async def controlla(app, message):
 
 # CallBackQuery Bottoni
 @app.on_callback_query()
-def callback_query(app, CallbackQuery):
+async def callback_query(app, CallbackQuery):
     passaggio = CallbackQuery.data.split("/", 1)
 
     with closing(psycopg2.connect(
@@ -251,14 +252,14 @@ def callback_query(app, CallbackQuery):
 
             # Modalità di ricerca
             if CallbackQuery.data == "ricerca":
-                CallbackQuery.edit_message_text(text="""⌨ <b>Digita</b> qualsiasi parola chiave tu voglia, ad esempio: 
+                await CallbackQuery.edit_message_text(text="""⌨ <b>Digita</b> qualsiasi parola chiave tu voglia, ad esempio: 
         
 <b>- Settore, Ruolo, Tipo di Contratto</b> 
 <b>- Città, Regione, Diploma o Laurea</b> 
 <b>- Data di Scadenza o Pubblicazione</b>""",
-                                                reply_markup=InlineKeyboardMarkup(
-                                                    [[InlineKeyboardButton('Annulla ❌', callback_data="menu")]]),
-                                                disable_web_page_preview=False)
+                                                      reply_markup=InlineKeyboardMarkup(
+                                                          [[InlineKeyboardButton('Annulla ❌', callback_data="menu")]]),
+                                                      disable_web_page_preview=False)
 
             # Gestisco la regione di preferenza
             if passaggio[0] == "aggiungi":
@@ -316,7 +317,7 @@ def callback_query(app, CallbackQuery):
                 new_check = cur.fetchone()
 
                 if new_check is None:
-                    CallbackQuery.edit_message_text(
+                    await CallbackQuery.edit_message_text(
                         text=
                         """❓ Per verificare il corretto funzionamento, devi spuntare l'opzione <b>Nuovo</b> nella pagina 4.
         
@@ -350,14 +351,14 @@ Clicca il pulsante sotto per tornare indietro.""",
                             testo = testo + \
                                     f"""➤ <a href='{annunciobuono[2]}'>{annunciobuono[3]}</a> | 🔗 \n"""
 
-                        CallbackQuery.edit_message_text(
+                        await CallbackQuery.edit_message_text(
                             text=f"""🚄 Annunci corrispondenti ai <b>filtri:</b>\n\n{testo}
 I prossimi annunci verranno inviati direttamente in questa chat!""",
                             reply_markup=InlineKeyboardMarkup(pulsanti),
                             disable_web_page_preview=True)
 
                     else:
-                        CallbackQuery.edit_message_text(
+                        await CallbackQuery.edit_message_text(
                             text="""😢 <b>Ci dispiace...</b>
         
 Non ci sono annunci con i <b>filtri</b> applicati.""",
@@ -490,9 +491,9 @@ Pagina <code>{paginattuale}/5</code>.
         
 Verranno inviati gli annunci che rispettano i tuoi filtri, prova!"""
 
-                CallbackQuery.edit_message_text(text=testo,
-                                                reply_markup=InlineKeyboardMarkup(bottoni),
-                                                disable_web_page_preview=True)
+                await CallbackQuery.edit_message_text(text=testo,
+                                                      reply_markup=InlineKeyboardMarkup(bottoni),
+                                                      disable_web_page_preview=True)
 
             # Visualizzo il profilo dell'utente
             if CallbackQuery.data == "profilo":
@@ -502,13 +503,13 @@ Verranno inviati gli annunci che rispettano i tuoi filtri, prova!"""
                             InlineKeyboardButton('Personalizza 📣', callback_data="personalizza")],
                            [InlineKeyboardButton('Indietro ↩', callback_data="menu")]]
 
-                CallbackQuery.edit_message_text(text=f"""Questo è il tuo <b>Profilo 👤</b>
+                await CallbackQuery.edit_message_text(text=f"""Questo è il tuo <b>Profilo 👤</b>
         
 Qui potrai decidere di quali annunci ricevere le <i>notifiche</i> e salvare quelli che più ti <i>interessano</i>!
         
 👥 <b>Utenti</b> » <code>{cur.fetchone()[0]}</code> """,
-                                                reply_markup=InlineKeyboardMarkup(bottoni),
-                                                disable_web_page_preview=True)
+                                                      reply_markup=InlineKeyboardMarkup(bottoni),
+                                                      disable_web_page_preview=True)
 
             # Visualizza gli annunci preferiti dell'utente
             if CallbackQuery.data == "preferiti":
@@ -519,13 +520,13 @@ Qui potrai decidere di quali annunci ricevere le <i>notifiche</i> e salvare quel
                 home = [[InlineKeyboardButton('Indietro ↩', callback_data="menu")]]
 
                 if len(favorites) == 0:
-                    CallbackQuery.edit_message_text(text="""🏷 <b>Questa</b> è la lista dei tuoi annunci <b>preferiti!</b>
+                    await CallbackQuery.edit_message_text(text="""🏷 <b>Questa</b> è la lista dei tuoi annunci <b>preferiti!</b>
         
 A quanto pare non è stato salvato nessun annuncio.
         
 Per <b>aggiungerne</b>, puoi digitare il pulsante sotto ogni annuncio presente nel canale <b>@concorsiferrovie 🚄</b>""",
-                                                    reply_markup=InlineKeyboardMarkup(home),
-                                                    disable_web_page_preview=False)
+                                                          reply_markup=InlineKeyboardMarkup(home),
+                                                          disable_web_page_preview=False)
                 else:
                     cur.execute("SELECT * FROM jobs WHERE id IN %s", (tuple(list(map(lambda x: x[1], favorites))),))
                     testo = "🏷 <b>Questa</b> è la lista dei tuoi annunci <b>preferiti!</b> \n\n"
@@ -537,9 +538,9 @@ Per <b>aggiungerne</b>, puoi digitare il pulsante sotto ogni annuncio presente n
                                 " | <a href='t.me/concorsiferroviebot?start=unlike_" + str(favorite[0]) + "'>🔗</a> \n"
 
                     testo = testo + "\nPer <b>rimuovere</b> quelli a cui non sei più interessato, digita sull'emoji a destra 🔗."
-                    CallbackQuery.edit_message_text(text=testo,
-                                                    reply_markup=InlineKeyboardMarkup(home),
-                                                    disable_web_page_preview=True)
+                    await CallbackQuery.edit_message_text(text=testo,
+                                                          reply_markup=InlineKeyboardMarkup(home),
+                                                          disable_web_page_preview=True)
 
             # Ultimi annunci presenti nel db
             if CallbackQuery.data == "ultime":
@@ -551,7 +552,7 @@ Per <b>aggiungerne</b>, puoi digitare il pulsante sotto ogni annuncio presente n
                 for i in cur.fetchall():
                     messaggio = messaggio + f"➤ <a href={i[2]}> {i[3]} </a> |  {i[1]}\n"
 
-                CallbackQuery.edit_message_text(
+                await CallbackQuery.edit_message_text(
                     text=messaggio,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Indietro ↩', callback_data="menu")]]),
                     disable_web_page_preview=True)
@@ -559,11 +560,11 @@ Per <b>aggiungerne</b>, puoi digitare il pulsante sotto ogni annuncio presente n
             # Contatto per l'assistenza
             if CallbackQuery.data == "assistenza":
                 annulla = [[InlineKeyboardButton('Annulla ❌', callback_data="menu")]]
-                CallbackQuery.edit_message_text(text="""👉🏻 <b>Rispondi</b> trascinando verso sinistra questo messaggio, poi <b>digita</b> il messaggio per contattare </b>l'assistenza del bot</b>.
+                await CallbackQuery.edit_message_text(text="""👉🏻 <b>Rispondi</b> trascinando verso sinistra questo messaggio, poi <b>digita</b> il messaggio per contattare </b>l'assistenza del bot</b>.
         
 💡 La <b>richiesta</b> deve essere inviata in un <b>unico messaggio</b>, altri messaggi <b>non saranno recapitati</b>.""",
-                                                reply_markup=InlineKeyboardMarkup(annulla),
-                                                disable_web_page_preview=False)
+                                                      reply_markup=InlineKeyboardMarkup(annulla),
+                                                      disable_web_page_preview=False)
 
             # Recupero le regioni in modo univoco dal db
             if CallbackQuery.data == "listaregioni":
@@ -598,7 +599,7 @@ Per <b>aggiungerne</b>, puoi digitare il pulsante sotto ogni annuncio presente n
                     bottonilista.append([InlineKeyboardButton('Italia 🇮🇹', callback_data="query/zone/Italia/1")])
                 bottonilista.append([InlineKeyboardButton('Indietro ↩', callback_data="menu")])
 
-                CallbackQuery.edit_message_text(testoquery, reply_markup=InlineKeyboardMarkup(bottonilista))
+                await CallbackQuery.edit_message_text(testoquery, reply_markup=InlineKeyboardMarkup(bottonilista))
 
             # Recupero i settori in modo univoco dal db
             if CallbackQuery.data == "listasettore":
@@ -620,7 +621,7 @@ Per <b>aggiungerne</b>, puoi digitare il pulsante sotto ogni annuncio presente n
 
                 bottonilista.append([InlineKeyboardButton('Indietro ↩', callback_data="menu")])
 
-                CallbackQuery.edit_message_text(testoquery, reply_markup=InlineKeyboardMarkup(bottonilista))
+                await CallbackQuery.edit_message_text(testoquery, reply_markup=InlineKeyboardMarkup(bottonilista))
 
             # Visualizzo annunci impaginati
             if "query/" in CallbackQuery.data:
@@ -708,13 +709,13 @@ Pagina {page_number}/{max_page}\n\n"""
 
                     bottoneinfo.append([InlineKeyboardButton('Indietro ↩', callback_data="listaregioni")])
 
-                CallbackQuery.edit_message_text(messaggio,
-                                                reply_markup=InlineKeyboardMarkup(bottoneinfo),
-                                                disable_web_page_preview=True)
+                await CallbackQuery.edit_message_text(messaggio,
+                                                      reply_markup=InlineKeyboardMarkup(bottoneinfo),
+                                                      disable_web_page_preview=True)
 
             # Menu principale
             if CallbackQuery.data == "menu":
-                CallbackQuery.edit_message_text(
+                await CallbackQuery.edit_message_text(
                     start_message,
                     reply_markup=InlineKeyboardMarkup(start_message_buttons),
                     disable_web_page_preview=False)
@@ -730,213 +731,206 @@ async def elimina(app, message):
 
 # Scraping
 async def scraping():
-    with closing(psycopg2.connect(
-            database=os.environ["db_name"],
-            host=os.environ["db_host"],
-            user=os.environ["db_user"],
-            password=os.environ["db_password"],
-            port=os.environ["db_port"]
-    )) as conn:
-        with conn.cursor() as cur:
-            users_blocked = []
-            driver = webdriver.Chrome(options)
+    driver = webdriver.Chrome(options)
+    try:
+        with closing(psycopg2.connect(
+                database=os.environ["db_name"],
+                host=os.environ["db_host"],
+                user=os.environ["db_user"],
+                password=os.environ["db_password"],
+                port=os.environ["db_port"]
+        )) as conn:
+            with conn.cursor() as cur:
+                users_blocked = []
 
-            driver.get(DOMAIN + "jobs.php")
+                driver.get(DOMAIN + "jobs.php")
 
-            driver.implicitly_wait(10)
-
-            driver.delete_cookie('lang')
-
-            driver.add_cookie({
-                'name': 'lang',
-                'value': 'it_IT',
-                'domain': '.fscareers.gruppofs.it',  # Assicurati di usare il dominio corretto
-                'path': '/',
-                'secure': True,
-                'httpOnly': True,
-                'sameSite': 'None'
-            })
-
-            driver.refresh()
-
-            try:
-                wait = WebDriverWait(driver, 20)  # Aspetta max 20 secondi
-                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "searchResultsBody")))
-
-                # Aspetta anche che ci siano dei risultati dentro
-                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "singleResult")))
-
-
-            except Exception as e:
-                print(f"Timeout: elementi non trovati - {e}")
-
-            soup = BeautifulSoup(driver.page_source, "lxml")
-
-            results = soup.find("div", {
-                "class": "searchResultsBody"
-            }).find_all("div", {"class": "singleResult responsiveOnly"})
-
-            for result in results:
-
-                details = result.find("div", {"class": "details"})
-
-                jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
-                jobTitle = details.find("h3").text.strip()
-
-                lista_posizione = [
-                    span.text.strip().title() for span in details.find_next(
-                        string="Sede:").find_next("td").find_next("span").find_all("span")
-                    if span.text.strip()
-                ]
-
-                jobZone = ' , '.join(lista_posizione)
-
-                driver.get(jobUrl)
                 driver.implicitly_wait(10)
-                driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
+
+                driver.delete_cookie('lang')
+
+                driver.add_cookie({
+                    'name': 'lang',
+                    'value': 'it_IT',
+                    'domain': '.fscareers.gruppofs.it',  # Assicurati di usare il dominio corretto
+                    'path': '/',
+                    'secure': True,
+                    'httpOnly': True,
+                    'sameSite': 'None'
+                })
+
                 driver.refresh()
 
-                print(driver.page_source)
-
-                soupannuncio = BeautifulSoup(driver.page_source, 'lxml')
-
                 try:
-                    description = soupannuncio.find("div", {
-                        "itemprop": "description"
-                    })
-                    if description is None:
-                        description = soupannuncio.find("div", {
-                            "class": "descriptionContainer"})
+                    wait = WebDriverWait(driver, 20)  # Aspetta max 20 secondi
+                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "searchResultsBody")))
 
-                    jobDescription = description.text.strip()
-                except:
-                    jobDescription = soupannuncio.find("div", {
-                        "class": "locationList"
-                    }).text.strip()
+                    # Aspetta anche che ci siano dei risultati dentro
+                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "singleResult")))
 
-                jobSector = details.find_next(string="Settore:").find_next("span").text
-                jobRole = details.find_next(string="Ruolo:").find_next("span").text
 
-                jobDate = details.find("span", {"class": "date"}).text
+                except Exception as e:
+                    print(f"Timeout: elementi non trovati - {e}")
 
-                dateDB = datetime.strptime(jobDate, '%d/%m/%Y').strftime('%Y-%m-%d')
+                soup = BeautifulSoup(driver.page_source, "lxml")
 
-                parsed_url = urlparse(jobUrl)
-                params = parse_qs(parsed_url.query)
-                jobID = params['id'][0]
+                results = soup.find("div", {
+                    "class": "searchResultsBody"
+                }).find_all("div", {"class": "singleResult responsiveOnly"})
 
-                cur.execute("SELECT * FROM jobs WHERE id = %s", (jobID,))
-                jobDB = cur.fetchone()
+                for result in results:
 
-                if jobDB is not None:
-                    if str(jobDB[1]) != str(dateDB):
-                        cur.execute(
-                            "UPDATE jobs SET date = %s, sector = %s, role = %s, zone = %s, title = %s WHERE id = %s",
-                            (dateDB, jobSector, jobRole, jobZone, jobTitle, jobID))
+                    details = result.find("div", {"class": "details"})
 
-                        aggiornobuttons = [[
-                            InlineKeyboardButton('Visualizza messaggio 🔗', url=f"t.me/concorsiferrovie/{jobDB[7]}"),
-                            InlineKeyboardButton('Guadagna 💰', url="https://t.me/concorsiferrovie/1430")
-                        ]]
+                    jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
+                    jobTitle = details.find("h3").text.strip()
 
-                        await app.send_message(chat_id=CHAT_ID,
-                                               text=f"""📣 <b>Annuncio aggiornato!</b>
-        
+                    lista_posizione = [
+                        span.text.strip().title() for span in details.find_next(
+                            string="Sede:").find_next("td").find_next("span").find_all("span")
+                        if span.text.strip()
+                    ]
+
+                    jobZone = ' , '.join(lista_posizione)
+
+                    driver.get(jobUrl)
+                    driver.implicitly_wait(10)
+                    driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
+                    driver.refresh()
+
+                    soupannuncio = BeautifulSoup(driver.page_source, 'lxml')
+
+                    description = (
+                            soupannuncio.find("div", {"itemprop": "description"}) or
+                            soupannuncio.find("div", {"class": "descriptionContainer"}) or
+                            soupannuncio.find("div", {"class": "locationList"})
+                    )
+                    jobDescription = description.text.strip() if description else ""
+
+                    jobSector = details.find_next(string="Settore:").find_next("span").text
+                    jobRole = details.find_next(string="Ruolo:").find_next("span").text
+
+                    jobDate = details.find("span", {"class": "date"}).text
+
+                    dateDB = datetime.strptime(jobDate, '%d/%m/%Y').strftime('%Y-%m-%d')
+
+                    parsed_url = urlparse(jobUrl)
+                    params = parse_qs(parsed_url.query)
+                    jobID = params['id'][0]
+
+                    cur.execute("SELECT * FROM jobs WHERE id = %s", (jobID,))
+                    jobDB = cur.fetchone()
+
+                    if jobDB is not None:
+                        if str(jobDB[1]) != str(dateDB):
+                            cur.execute(
+                                "UPDATE jobs SET date = %s, sector = %s, role = %s, zone = %s, title = %s WHERE id = %s",
+                                (dateDB, jobSector, jobRole, jobZone, jobTitle, jobID))
+
+                            aggiornobuttons = [[
+                                InlineKeyboardButton('Visualizza messaggio 🔗', url=f"t.me/concorsiferrovie/{jobDB[7]}"),
+                                InlineKeyboardButton('Guadagna 💰', url="https://t.me/concorsiferrovie/1430")
+                            ]]
+
+                            await app.send_message(chat_id=CHAT_ID,
+                                                   text=f"""📣 <b>Annuncio aggiornato!</b>
+            
 🔗 <a href='{jobUrl}'>{jobTitle}</a>
-        
+            
 📅 __Data aggiornata: {jobDate}__""",
-                                               reply_markup=InlineKeyboardMarkup(aggiornobuttons),
-                                               reply_to_message_id=jobDB[7],
-                                               disable_web_page_preview=True)
+                                                   reply_markup=InlineKeyboardMarkup(aggiornobuttons),
+                                                   reply_to_message_id=jobDB[7],
+                                                   disable_web_page_preview=True)
 
-                else:
-                    telegraph.create_account("@ConcorsiFerrovie")
-                    response = telegraph.create_page(f'{jobTitle}',
-                                                     html_content=f'<p>{jobDescription}</p>')
+                    else:
+                        telegraph.create_account("@ConcorsiFerrovie")
+                        response = telegraph.create_page(f'{jobTitle}',
+                                                         html_content=f'<p>{jobDescription}</p>')
 
-                    annunciobuttons = [[
-                        InlineKeyboardButton(
-                            'Condividi il canale ❗',
-                            url=
-                            "https://telegram.me/share/url?url=https://telegram.me/concorsiferrovie&text=Unisciti%20per%20ricevere%20notifiche%20sulle%20nuove%20posizioni%20disponibili%20sul%20sito%20delle%20Ferrovie%20Dello%20Stato%20"
-                        ),
-                        InlineKeyboardButton('Gruppo discussione 🗣',
-                                             url="t.me/selezioniconcorsiferrovie")
-                    ], [InlineKeyboardButton('Descrizione 📃', url=f"{response['url']}")],
-                        [InlineKeyboardButton('Guadagna 💰',
-                                              url="https://t.me/concorsiferrovie/1430"),
+                        annunciobuttons = [[
+                            InlineKeyboardButton(
+                                'Condividi il canale ❗',
+                                url=
+                                "https://telegram.me/share/url?url=https://telegram.me/concorsiferrovie&text=Unisciti%20per%20ricevere%20notifiche%20sulle%20nuove%20posizioni%20disponibili%20sul%20sito%20delle%20Ferrovie%20Dello%20Stato%20"
+                            ),
+                            InlineKeyboardButton('Gruppo discussione 🗣',
+                                                 url="t.me/selezioniconcorsiferrovie")
+                        ], [InlineKeyboardButton('Descrizione 📃', url=f"{response['url']}")],
+                            [InlineKeyboardButton('Guadagna 💰',
+                                                  url="https://t.me/concorsiferrovie/1430"),
 
-                         InlineKeyboardButton(
-                             'Aggiungi ai preferiti 🏷',
-                             url="t.me/concorsiferroviebot?start=like_" + jobID + "")
-                         ]]
+                             InlineKeyboardButton(
+                                 'Aggiungi ai preferiti 🏷',
+                                 url="t.me/concorsiferroviebot?start=like_" + jobID + "")
+                             ]]
 
-                    sentMessage = await app.send_message(CHAT_ID,
-                                                         f"""🚄 <b>Nuovo annuncio!</b>
-        
+                        sentMessage = await app.send_message(CHAT_ID,
+                                                             f"""🚄 <b>Nuovo annuncio!</b>
+            
 🔗 <a href='{jobUrl}'>{jobTitle}</a>
-        
+            
 📍 Sede: <b>{jobZone}</b>
 💼 Settore: <b>{jobSector}</b>
 📄 Ruolo: <b>{jobRole}</b>
-        
+            
 📅 <i>Data di pubblicazione: {jobDate}</i>""",
-                                                         reply_markup=InlineKeyboardMarkup(annunciobuttons),
-                                                         disable_web_page_preview=True)
+                                                             reply_markup=InlineKeyboardMarkup(annunciobuttons),
+                                                             disable_web_page_preview=True)
 
-                    annunciobuttons.append([
-                        InlineKeyboardButton("Condividi su WhatsApp 📱", url=url_normalize(
-                            "https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+delle+Ferrovie+Dello+Stato:+"
-                            + jobTitle.replace(' ', '+') + "+" + sentMessage.link))
-                    ])
+                        annunciobuttons.append([
+                            InlineKeyboardButton("Condividi su WhatsApp 📱", url=url_normalize(
+                                "https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+delle+Ferrovie+Dello+Stato:+"
+                                + jobTitle.replace(' ', '+') + "+" + sentMessage.link))
+                        ])
 
-                    message_edited = await app.edit_message_reply_markup(chat_id=CHAT_ID, message_id=sentMessage.id,
-                                                                         reply_markup=InlineKeyboardMarkup(
-                                                                             annunciobuttons))
+                        message_edited = await app.edit_message_reply_markup(chat_id=CHAT_ID, message_id=sentMessage.id,
+                                                                             reply_markup=InlineKeyboardMarkup(
+                                                                                 annunciobuttons))
 
-                    cur.execute(
-                        "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values (%s, %s, %s, %s, %s, "
-                        "%s, %s, %s)",
-                        (jobID, dateDB, jobUrl, jobTitle, jobZone, jobRole, jobSector, sentMessage.id))
+                        cur.execute(
+                            "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values (%s, %s, %s, %s, %s, "
+                            "%s, %s, %s)",
+                            (jobID, dateDB, jobUrl, jobTitle, jobZone, jobRole, jobSector, sentMessage.id))
 
-                    cur.execute("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
-                    users = cur.fetchall()
-                    for user in users:
-                        cur.execute("SELECT type FROM sectors WHERE idUser = %s", (user[0],))
-                        user_sectors = cur.fetchall()
-                        cur.execute("SELECT zone FROM zones WHERE idUser = %s", (user[0],))
-                        user_zones = cur.fetchall()
+                        cur.execute("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
+                        users = cur.fetchall()
+                        for user in users:
+                            cur.execute("SELECT type FROM sectors WHERE idUser = %s", (user[0],))
+                            user_sectors = cur.fetchall()
+                            cur.execute("SELECT zone FROM zones WHERE idUser = %s", (user[0],))
+                            user_zones = cur.fetchall()
 
-                        send = False
-                        if user_zones and user_sectors:
-                            if jobSector in [sector[0] for sector in user_sectors] and any(
-                                    zone[0] in jobZone for zone in user_zones):
+                            send = False
+                            if user_zones and user_sectors:
+                                if jobSector in [sector[0] for sector in user_sectors] and any(
+                                        zone[0] in jobZone for zone in user_zones):
+                                    send = True
+                            elif user_zones:
+                                if any(zone[0] in jobZone for zone in user_zones):
+                                    send = True
+                            elif user_sectors:
+                                if jobSector in [sector[0] for sector in user_sectors]:
+                                    send = True
+                            else:
                                 send = True
-                        elif user_zones:
-                            if any(zone[0] in jobZone for zone in user_zones):
-                                send = True
-                        elif user_sectors:
-                            if jobSector in [sector[0] for sector in user_sectors]:
-                                send = True
-                        else:
-                            send = True
-                        if send:
-                            try:
-                                await app.forward_messages(chat_id=user[0],
-                                                           from_chat_id=CHAT_ID,
-                                                           message_ids=message_edited.id)
-                            except:
-                                users_blocked.append(user[0])
+                            if send:
+                                try:
+                                    await app.forward_messages(chat_id=user[0],
+                                                               from_chat_id=CHAT_ID,
+                                                               message_ids=message_edited.id)
+                                except:
+                                    users_blocked.append(user[0])
+                    conn.commit()
+                if len(users_blocked) > 0:
+                    cur.execute("DELETE FROM favorites WHERE idUser IN %s", (tuple(users_blocked),))
+                    cur.execute("DELETE FROM sectors WHERE idUser IN %s", (tuple(users_blocked),))
+                    cur.execute("DELETE FROM zones WHERE idUser IN %s", (tuple(users_blocked),))
+                    cur.execute("DELETE FROM notifications WHERE idUser IN %s", (tuple(users_blocked),))
+                    cur.execute("DELETE FROM users WHERE id IN %s", (tuple(users_blocked),))
+
                 conn.commit()
-            if len(users_blocked) > 0:
-                cur.execute("DELETE FROM favorites WHERE idUser IN %s", (tuple(users_blocked),))
-                cur.execute("DELETE FROM sectors WHERE idUser IN %s", (tuple(users_blocked),))
-                cur.execute("DELETE FROM zones WHERE idUser IN %s", (tuple(users_blocked),))
-                cur.execute("DELETE FROM notifications WHERE idUser IN %s", (tuple(users_blocked),))
-                cur.execute("DELETE FROM users WHERE id IN %s", (tuple(users_blocked),))
-
-            conn.commit()
-    driver.quit()
+    finally:
+        driver.quit()
     await app.send_message(chat_id=5239432590, text="Finito scrape")
 
 
@@ -953,20 +947,18 @@ async def clean():
             cur.execute("SELECT * FROM jobs")
             jobs = cur.fetchall()
 
-            driver = webdriver.Chrome(options)
-            driver.get(DOMAIN)
-            driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
-            driver.refresh()
             delete_list = []
+            session = req_http.Session()
+            session.headers.update({'Accept-Language': 'it-IT,it;q=0.9'})
 
             for job in jobs:
-
-                driver.get(job[2])
-                driver.implicitly_wait(10)
-                soup = BeautifulSoup(driver.page_source, "lxml")
-
-                if soup.find("div", {"class": "searchTitle"}) is not None:
-                    delete_list.append(job[0])
+                try:
+                    resp = session.get(job[2], timeout=15)
+                    soup = BeautifulSoup(resp.text, "lxml")
+                    if soup.find("div", {"class": "searchTitle"}) is not None:
+                        delete_list.append(job[0])
+                except Exception:
+                    pass
 
             if len(delete_list) > 0:
                 cur.execute("DELETE FROM favorites WHERE idJob IN %s", (tuple(delete_list),))
@@ -974,7 +966,6 @@ async def clean():
 
             conn.commit()
 
-    driver.quit()
     await app.send_message(chat_id=5239432590, text="Finito clean")
 
 

@@ -9,3 +9,4 @@ selenium
 python-dotenv
 Flask
 psycopg2
+requests
