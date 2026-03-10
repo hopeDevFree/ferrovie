@@ -981,7 +981,7 @@ async def safe_scraping():
 
 loop = asyncio.get_event_loop()
 scheduler = AsyncIOScheduler(timezone="Europe/Rome", event_loop=loop)
-scheduler.add_job(safe_clean, "cron", hour=1, next_run_time=datetime.now() + timedelta(seconds=30))
+scheduler.add_job(safe_clean, "cron", hour=1)
 scheduler.add_job(safe_scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
