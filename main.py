@@ -22,6 +22,7 @@ from keep_alive import keep_alive
 import psycopg2
 from urllib.parse import urlparse, parse_qs
 import requests as req_http
+import gc
 
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
@@ -30,6 +31,13 @@ options.add_argument("--headless")
 options.add_argument("--disable-gpu")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--disable-extensions")
+options.add_argument("--disable-plugins")
+options.add_argument("--disable-background-networking")
+options.add_argument("--disable-sync")
+options.add_argument("--no-first-run")
+options.add_argument("--disable-default-apps")
+options.add_argument("--blink-settings=imagesEnabled=false")
 
 telegraph = Telegraph()
 
@@ -806,6 +814,7 @@ async def scraping():
                             soupannuncio.find("div", {"class": "locationList"})
                     )
                     jobDescription = description.text.strip() if description else ""
+                    del soupannuncio, description
 
                     jobSector = details.find_next(string="Settore:").find_next("span").text
                     jobRole = details.find_next(string="Ruolo:").find_next("span").text
@@ -921,6 +930,8 @@ async def scraping():
                                 except:
                                     users_blocked.append(user[0])
                     conn.commit()
+                del soup, results
+                gc.collect()
                 if len(users_blocked) > 0:
                     cur.execute("DELETE FROM favorites WHERE idUser IN %s", (tuple(users_blocked),))
                     cur.execute("DELETE FROM sectors WHERE idUser IN %s", (tuple(users_blocked),))
