@@ -40,6 +40,7 @@ options.add_argument("--disable-default-apps")
 options.add_argument("--blink-settings=imagesEnabled=false")
 
 telegraph = Telegraph()
+telegraph.create_account("@ConcorsiFerrovie")
 
 lock = asyncio.Lock()
 
@@ -852,9 +853,8 @@ async def scraping():
                                                    disable_web_page_preview=True)
 
                     else:
-                        telegraph.create_account("@ConcorsiFerrovie")
                         response = telegraph.create_page(f'{jobTitle}',
-                                                         html_content=f'<p>{jobDescription}</p>')
+                                                         html_content=f'<p>{jobDescription or "Descrizione non disponibile."}</p>')
 
                         annunciobuttons = [[
                             InlineKeyboardButton(
@@ -992,7 +992,7 @@ async def safe_scraping():
 
 loop = asyncio.get_event_loop()
 scheduler = AsyncIOScheduler(timezone="Europe/Rome", event_loop=loop)
-scheduler.add_job(safe_clean, "cron", hour=1)
+scheduler.add_job(safe_clean, "cron", hour=1, misfire_grace_time=300)
 scheduler.add_job(safe_scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
 scheduler.start()
 keep_alive()
