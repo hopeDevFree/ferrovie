@@ -54,6 +54,29 @@ app = Client("ferrovie_bot",
 CHAT_ID = int(os.environ['chat_id'])
 DOMAIN = "https://fscareers.gruppofs.it/"
 
+
+async def create_telegraph_page_url(title, description, retries=3):
+    html_content = f'<p>{description or "Descrizione non disponibile."}</p>'
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            response = await asyncio.to_thread(
+                telegraph.create_page,
+                title,
+                html_content=html_content
+            )
+            return response["url"]
+        except Exception as exc:
+            last_error = exc
+            print(f"Telegraph create_page failed ({attempt}/{retries}) for '{title}': {exc}")
+            if attempt < retries:
+                await asyncio.sleep(min(attempt * 2, 5))
+
+    print(f"Telegraph unavailable for '{title}'. Skipping publish until Telegraph succeeds. Last error: {last_error}")
+    return None
+
+
 start_message = """Ciao! Questo è un bot <b>non ufficiale</b> delle <b>Ferrovie Dello Stato</b> 🚄
 <a href= https://telegra.ph/file/9d5be8ab56b1788848e60.jpg> </a>
 Unisciti al canale per rimanere aggiornato sulle posizioni presenti sul <a href=https://fscareers.gruppofs.it/jobs.php><b>sito ufficiale</b></a> ❗
@@ -853,8 +876,11 @@ async def scraping():
                                                    disable_web_page_preview=True)
 
                     else:
-                        response = telegraph.create_page(f'{jobTitle}',
-                                                         html_content=f'<p>{jobDescription or "Descrizione non disponibile."}</p>')
+                        telegraph_url = await create_telegraph_page_url(jobTitle, jobDescription)
+                        if not telegraph_url:
+                            print(f"Skipping job {jobID} because Telegraph page creation failed.")
+                            continue
+                        response = {"url": telegraph_url}
 
                         annunciobuttons = [[
                             InlineKeyboardButton(
