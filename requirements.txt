@@ -7,5 +7,5 @@ telegraph
 selenium
 python-dotenv
 Flask
-psycopg2
+asyncpg
 requests
