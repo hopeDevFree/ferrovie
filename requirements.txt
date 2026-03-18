@@ -1,9 +1,8 @@
 url_normalize
-tgcrypto
+aiogram
 bs4
 lxml
 APScheduler
-git+https://github.com/KurimuzonAkuma/pyrogram.git@v2.1.17
 telegraph
 selenium
 python-dotenv
