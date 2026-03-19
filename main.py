@@ -115,8 +115,8 @@ async def init_db():
         user=os.environ["db_user"],
         password=os.environ["db_password"],
         port=os.environ["db_port"],
-        min_size=2,
-        max_size=10,
+        min_size=1,
+        max_size=3,
         statement_cache_size=0
     )
 
