@@ -1,5 +1,8 @@
 import asyncio
+import logging
 import math
+import re
+import time
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
@@ -23,13 +26,43 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from keep_alive import keep_alive
 import asyncpg
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 import requests as req_http
 import gc
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logger = logging.getLogger("ferrovie")
+
 LANG_COOKIE = {"name": "lang", "value": "it_IT"}
+HTTP_TIMEOUT = 30
+HTTP_HEADERS = {
+    "Accept-Language": "it-IT,it;q=0.9",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/133.0.0.0 Safari/537.36"
+    )
+}
+
+ITALIAN_MONTHS = {
+    "gennaio": "01",
+    "febbraio": "02",
+    "marzo": "03",
+    "aprile": "04",
+    "maggio": "05",
+    "giugno": "06",
+    "luglio": "07",
+    "agosto": "08",
+    "settembre": "09",
+    "ottobre": "10",
+    "novembre": "11",
+    "dicembre": "12",
+}
 
 
 def build_chrome_options():
@@ -94,11 +127,163 @@ def load_page_source(driver, url, wait_locators=None):
 
     return driver.page_source
 
+
+def create_http_session():
+    session = req_http.Session()
+    session.headers.update(HTTP_HEADERS)
+    session.cookies.set(LANG_COOKIE["name"], LANG_COOKIE["value"])
+    return session
+
+
+def with_source_param(url, source="Bot"):
+    parts = urlsplit(url)
+    query_params = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "source"]
+    query_params.append(("source", source))
+    return urlunsplit(parts._replace(query=urlencode(query_params, doseq=True)))
+
+
+def fetch_page_source_http(session, url):
+    response = session.get(with_source_param(url), timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+    return response.text
+
+
+def get_results_container(soup):
+    return soup.find("div", {"class": "searchResultsBody"})
+
+
+def get_result_cards(results_container):
+    return results_container.find_all(
+        "div",
+        class_=lambda value: value and "singleResult" in value
+    )
+
+
+def get_description_node(soup):
+    return (
+            soup.find("div", {"itemprop": "description"}) or
+            soup.find("div", {"class": "descriptionContainer"}) or
+            soup.find("div", {"class": "locationList"})
+    )
+
+
+def parse_jobs_list_html(main_html):
+    soup = BeautifulSoup(main_html, "lxml")
+    results_container = get_results_container(soup)
+    if results_container is None:
+        raise ValueError("Contenitore risultati non trovato nell'HTML della lista annunci")
+
+    results = get_result_cards(results_container)
+    jobs_data = []
+    for result in results:
+        try:
+            details = result.find("div", {"class": "details"})
+            jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
+            jobTitle = details.find("h3").text.strip()
+
+            lista_posizione = [
+                span.text.strip().title() for span in details.find_next(
+                    string="Sede:").find_next("td").find_next("span").find_all("span")
+                if span.text.strip()
+            ]
+            jobZone = ' , '.join(lista_posizione)
+            jobSector = details.find_next(string="Settore:").find_next("span").text
+            jobRole = details.find_next(string="Ruolo:").find_next("span").text
+            jobDate = details.find("span", {"class": "date"}).text
+
+            parsed_url = urlparse(jobUrl)
+            params = parse_qs(parsed_url.query)
+            jobID = int(params['id'][0])
+
+            jobs_data.append({
+                'id': jobID, 'url': jobUrl, 'title': jobTitle,
+                'zone': jobZone, 'sector': jobSector, 'role': jobRole,
+                'date': jobDate, 'description_html': None
+            })
+        except Exception as e:
+            logger.warning("Errore parsing annuncio dalla lista: %s", e)
+            continue
+
+    return jobs_data
+
+
+def is_valid_detail_html(detail_html):
+    soup = BeautifulSoup(detail_html, "lxml")
+    return get_description_node(soup) is not None
+
+
+def extract_deadline_from_text(text):
+    patterns = [
+        r"Candidati\s+entro\s+(?:il\s+giorno\s+|il\s+)?(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+\d{4})",
+        r"entro\s+(?:il\s+giorno\s+|il\s+)?(\d{1,2}/\d{1,2}/\d{4}|\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+\d{4})"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            raw_deadline = re.sub(r"\s+", " ", match.group(1).strip())
+            numeric_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw_deadline)
+            if numeric_match:
+                day, month, year = numeric_match.groups()
+                return f"{int(day):02d}/{int(month):02d}/{year}"
+
+            textual_match = re.fullmatch(r"(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{4})", raw_deadline, flags=re.IGNORECASE)
+            if textual_match:
+                day, month_name, year = textual_match.groups()
+                month_number = ITALIAN_MONTHS.get(month_name.lower())
+                if month_number:
+                    return f"{int(day):02d}/{month_number}/{year}"
+    return None
+
+
+def sanitize_description_html(description_node):
+    allowed_tags = {"a", "b", "br", "em", "i", "li", "ol", "p", "strong", "u", "ul"}
+    container = BeautifulSoup(str(description_node), "lxml")
+    root = container.find(description_node.name)
+    if root is None:
+        return None, None
+
+    for tag in root.find_all(True):
+        if tag.name not in allowed_tags:
+            tag.unwrap()
+            continue
+        if tag.name == "a":
+            href = tag.get("href")
+            tag.attrs = {"href": href} if href else {}
+        else:
+            tag.attrs = {}
+
+    description_text = root.get_text(" ", strip=True).replace("\xa0", " ").strip()
+    description_html = root.decode_contents().replace("\xa0", " ").strip()
+    if not description_text or not description_html:
+        return None, None
+
+    return description_text, description_html
+
+
+def extract_job_detail_data(detail_html):
+    soup = BeautifulSoup(detail_html, "lxml")
+    description_node = get_description_node(soup)
+    if description_node is None:
+        return None
+
+    description_text, description_html = sanitize_description_html(description_node)
+    if not description_text or not description_html:
+        return None
+
+    page_text = soup.get_text(" ", strip=True).replace("\xa0", " ")
+    return {
+        "description_text": description_text,
+        "description_html": description_html,
+        "deadline": extract_deadline_from_text(page_text)
+    }
+
+
 telegraph = Telegraph()
 try:
     telegraph.create_account("@ConcorsiFerrovie")
 except Exception as e:
-    print(f"Telegraph create_account failed at startup: {e}")
+    logger.warning("Telegraph create_account fallito all'avvio: %s", e)
 
 lock = asyncio.Lock()
 db_pool: asyncpg.Pool = None
@@ -111,6 +296,11 @@ dp.include_router(router)
 ADMIN_ID = 5239432590
 CHAT_ID = int(os.environ['chat_id'])
 DOMAIN = "https://fscareers.gruppofs.it/"
+CHANNEL_SHARE_URL = (
+    "https://telegram.me/share/url?url=https://telegram.me/concorsiferrovie"
+    "&text=Unisciti%20per%20ricevere%20notifiche%20sulle%20nuove%20posizioni%20"
+    "disponibili%20sul%20sito%20delle%20Ferrovie%20Dello%20Stato%20"
+)
 
 
 async def init_db():
@@ -127,8 +317,95 @@ async def init_db():
     )
 
 
-async def create_telegraph_page_url(title, description, retries=3):
-    html_content = f'<p>{description or "Descrizione non disponibile."}</p>'
+async def notify_admin_error(context, error=None):
+    details = f"{type(error).__name__}: {error}" if error is not None else "Nessun dettaglio aggiuntivo."
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=f"Errore bot: {context}\n{details}")
+    except Exception as exc:
+        logger.warning("Errore invio notifica admin per %s: %s", context, exc)
+
+
+def build_start_message_buttons():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Canale notifiche \u2757", url="t.me/concorsiferrovie"),
+         InlineKeyboardButton(text="Gruppo discussione \U0001F5E3", url="t.me/selezioniconcorsiferrovie")],
+        [InlineKeyboardButton(text="Ultime posizioni \U0001F4C5", callback_data="ultime")],
+        [InlineKeyboardButton(text="Lista per settore \U0001F477\U0001F3FB\u200d\u2642\ufe0f", callback_data="listasettore"),
+         InlineKeyboardButton(text="Lista per regione \U0001F4CD", callback_data="listaregioni")],
+        [InlineKeyboardButton(text="Cerca \U0001F50D", callback_data="ricerca")],
+        [InlineKeyboardButton(text="Profilo \U0001F464", callback_data="profilo"),
+         InlineKeyboardButton(text="Guadagna \U0001F4B0", url="https://t.me/concorsiferrovie/1430")],
+        [InlineKeyboardButton(text="Assistenza \u2709", callback_data="assistenza")]
+    ])
+
+
+def build_updated_job_buttons(message_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Visualizza messaggio \U0001F517", url=f"t.me/concorsiferrovie/{message_id}"),
+        InlineKeyboardButton(text="Guadagna \U0001F4B0", url="https://t.me/concorsiferrovie/1430")
+    ]])
+
+
+def build_channel_job_buttons(description_url, job_id, whatsapp_url=None, whatsapp_title=None):
+    buttons = [[
+        InlineKeyboardButton(text="Condividi il canale \u2757", url=CHANNEL_SHARE_URL),
+        InlineKeyboardButton(text="Gruppo discussione \U0001F5E3", url="t.me/selezioniconcorsiferrovie")
+    ], [
+        InlineKeyboardButton(text="Descrizione \U0001F4C3", url=description_url)
+    ], [
+        InlineKeyboardButton(text="Guadagna \U0001F4B0", url="https://t.me/concorsiferrovie/1430"),
+        InlineKeyboardButton(text="Aggiungi ai preferiti \U0001F3F7", url=f"t.me/concorsiferroviebot?start=like_{job_id}")
+    ]]
+
+    if whatsapp_url:
+        share_title = f"{whatsapp_title.replace(' ', '+')}+" if whatsapp_title else ""
+        buttons.append([
+            InlineKeyboardButton(
+                text="Condividi su WhatsApp \U0001F4F1",
+                url=url_normalize(
+                    "https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+delle+Ferrovie+Dello+Stato:+"
+                    + share_title + whatsapp_url
+                )
+            )
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def format_job_date(value):
+    return value.strftime("%d/%m/%Y") if hasattr(value, "strftime") else str(value)
+
+
+def build_channel_message_text(job, deadline=None, header="\U0001F686 <b>Nuovo annuncio!</b>"):
+    deadline_line = f"\\n\u23F3 <i>Data di scadenza: {deadline}</i>" if deadline else ""
+    publication_date = format_job_date(job["date"])
+    return f"""{header}
+
+\U0001F517 <a href='{job['url']}'>{job['title']}</a>
+
+\U0001F4CD Sede: <b>{job['zone']}</b>
+\U0001F4BC Settore: <b>{job['sector']}</b>
+\U0001F4C4 Ruolo: <b>{job['role']}</b>
+
+\U0001F4C5 <i>Data di pubblicazione: {publication_date}</i>{deadline_line}"""
+
+
+def fetch_latest_job_snapshot():
+    jobs_data, list_source = scrape_all_pages()
+    if not jobs_data:
+        raise ValueError("Nessun annuncio trovato sul sito")
+
+    latest_job = jobs_data[0]
+    detail_htmls, _ = scrape_detail_pages([latest_job["url"]])
+    detail_html = detail_htmls.get(latest_job["url"])
+    detail_data = extract_job_detail_data(detail_html) if detail_html else None
+
+    return latest_job, detail_data, list_source
+
+async def create_telegraph_page_url(title, html_content, retries=3):
+    if not html_content or not html_content.strip():
+        return None
+
     last_error = None
 
     for attempt in range(1, retries + 1):
@@ -141,30 +418,20 @@ async def create_telegraph_page_url(title, description, retries=3):
             return response["url"]
         except Exception as exc:
             last_error = exc
-            print(f"Telegraph create_page failed ({attempt}/{retries}) for '{title}': {exc}")
+            logger.warning("Telegraph create_page fallito (%s/%s) per '%s': %s", attempt, retries, title, exc)
             if attempt < retries:
                 await asyncio.sleep(min(attempt * 2, 5))
 
-    print(f"Telegraph unavailable for '{title}'. Last error: {last_error}")
+    logger.error("Telegraph non disponibile per '%s'. Ultimo errore: %s", title, last_error)
     return None
 
 
-start_message = """Ciao! Questo è un bot <b>non ufficiale</b> delle <b>Ferrovie Dello Stato</b> 🚄
+start_message = """Ciao! Questo \u00E8 un bot <b>non ufficiale</b> delle <b>Ferrovie Dello Stato</b> \U0001F686
 <a href="https://telegra.ph/file/9d5be8ab56b1788848e60.jpg"> </a>
-Unisciti al canale per rimanere aggiornato sulle posizioni presenti sul <a href="https://fscareers.gruppofs.it/jobs.php"><b>sito ufficiale</b></a> ❗
+Unisciti al canale per rimanere aggiornato sulle posizioni presenti sul <a href="https://fscareers.gruppofs.it/jobs.php"><b>sito ufficiale</b></a> \u2757
 
-<i>Usa i tasti per visualizzare le posizioni disponibili in base alle tue preferenze, o per cercarne una specifica</i> 👁"""
-start_message_buttons = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text='Canale notifiche ❗', url="t.me/concorsiferrovie"),
-     InlineKeyboardButton(text='Gruppo discussione 🗣  ', url="t.me/selezioniconcorsiferrovie")],
-    [InlineKeyboardButton(text='Ultime posizioni 📅 ', callback_data="ultime")],
-    [InlineKeyboardButton(text='Lista per settore 👷🏻‍♂️ ', callback_data="listasettore"),
-     InlineKeyboardButton(text='Lista per regione 📍 ', callback_data="listaregioni")],
-    [InlineKeyboardButton(text='Cerca 🔍 ', callback_data="ricerca")],
-    [InlineKeyboardButton(text='Profilo 👤', callback_data="profilo"),
-     InlineKeyboardButton(text='Guadagna 💰', url="https://t.me/concorsiferrovie/1430")],
-    [InlineKeyboardButton(text='Assistenza ✉', callback_data="assistenza")]
-])
+<i>Usa i tasti per visualizzare le posizioni disponibili in base alle tue preferenze, o per cercarne una specifica</i> \U0001F441"""
+start_message_buttons = build_start_message_buttons()
 
 
 # Comando Start
@@ -257,6 +524,36 @@ async def help_command(message: Message):
     await message.answer(
         "Vuoi chiedere informazioni? Unisciti al gruppo <b>@selezioniconcorsiferrovie</b>  👥")
 
+
+# Messaggio di test per l'admin
+@router.message(Command("test"), F.chat.type == "private", F.from_user.id == ADMIN_ID)
+async def test_command(message: Message):
+    try:
+        job, detail_data, list_source = await asyncio.to_thread(fetch_latest_job_snapshot)
+    except Exception as exc:
+        logger.exception("Errore nel test live admin: %s", exc)
+        await message.answer("Errore nel recupero dell'ultimo annuncio dal sito.")
+        return
+
+    if detail_data is None:
+        await message.answer(
+            f"Ultimo annuncio trovato via {list_source}, ma la descrizione o la scadenza non sono risultate leggibili."
+        )
+        return
+
+    telegraph_url = await create_telegraph_page_url(job['title'], detail_data['description_html'])
+    if not telegraph_url:
+        await message.answer("Ultimo annuncio trovato, ma la pagina Telegraph non \u00E8 stata generata.")
+        return
+
+    reply_markup = build_channel_job_buttons(telegraph_url, job['id'])
+    text = build_channel_message_text(job, detail_data.get('deadline'), header="\U0001F9EA <b>Anteprima annuncio live</b>")
+
+    await message.answer(
+        text=text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
 
 # Invio file guida alle selezioni
 @router.message(Command("selezioni"))
@@ -447,9 +744,9 @@ Cliccando su <b>Avanti</b> potrai passare alle pagine successive, per selezionar
 
                 if paginattuale == 2:
                     count_zones = await conn.fetchval("SELECT COUNT(*) FROM zones WHERE idUser = $1",
-                                                     callback.from_user.id)
-                    user_zones_rows = await conn.fetch("SELECT zone FROM zones WHERE idUser = $1",
                                                       callback.from_user.id)
+                    user_zones_rows = await conn.fetch("SELECT zone FROM zones WHERE idUser = $1",
+                                                       callback.from_user.id)
                     user_zones = [r['zone'] for r in user_zones_rows]
 
                     testo = f"""Scegli la <b>regione</b> a cui sei interessato per gli annunci 📍
@@ -480,9 +777,9 @@ Puoi sceglierne più di una e cambiarle in qualsiasi momento!"""
 
                 if paginattuale == 3:
                     count_sectors = await conn.fetchval("SELECT COUNT(*) FROM sectors WHERE idUser = $1",
-                                                       callback.from_user.id)
-                    user_sectors_rows = await conn.fetch("SELECT type FROM sectors WHERE idUser = $1",
                                                         callback.from_user.id)
+                    user_sectors_rows = await conn.fetch("SELECT type FROM sectors WHERE idUser = $1",
+                                                         callback.from_user.id)
                     user_sectors = [r['type'] for r in user_sectors_rows]
 
                     testo = f"""👷🏻‍♂️Scegli il settore!
@@ -510,9 +807,9 @@ Puoi sceglierne più di uno e cambiarli in qualsiasi momento!"""
 
                 if paginattuale == 4:
                     count_types = await conn.fetchval("SELECT COUNT(*) FROM notifications WHERE idUser = $1",
-                                                     callback.from_user.id)
-                    user_types_rows = await conn.fetch("SELECT type FROM notifications WHERE idUser = $1",
                                                       callback.from_user.id)
+                    user_types_rows = await conn.fetch("SELECT type FROM notifications WHERE idUser = $1",
+                                                       callback.from_user.id)
                     user_types = [r['type'] for r in user_types_rows]
 
                     testo = f"""🔔 Scegli la <b>tipologia</b> di notifiche!
@@ -840,8 +1137,27 @@ async def elimina(message: Message):
 
 
 # Scraping
-def scrape_all_pages():
-    """Fase 1: Chrome scarica tutto l'HTML, poi viene chiuso. Niente async qui."""
+def scrape_all_pages_http():
+    session = create_http_session()
+    try:
+        main_html = fetch_page_source_http(session, url_normalize(DOMAIN + "jobs.php?language=it_IT"))
+        jobs_data = parse_jobs_list_html(main_html)
+        if jobs_data:
+            top_job = jobs_data[0]
+            logger.info(
+                "HTTP_TOP_JOB_ID=%s HTTP_TOP_JOB_DATE=%s HTTP_TOP_JOB_TITLE=%s",
+                top_job["id"],
+                top_job["date"],
+                top_job["title"]
+            )
+        return jobs_data, "http"
+    finally:
+        session.close()
+
+
+def scrape_all_pages_selenium():
+    """Fallback: Chrome scarica tutto l'HTML, poi viene chiuso."""
+    logger.warning("Fallback a Selenium per la lista annunci.")
     driver = None
     try:
         driver = create_chrome_driver()
@@ -854,52 +1170,31 @@ def scrape_all_pages():
             ]
         )
 
-        # Estrai URL dei job dalla lista
-        soup = BeautifulSoup(main_html, "lxml")
-        results = soup.find("div", {"class": "searchResultsBody"}).find_all(
-            "div", {"class": "singleResult responsiveOnly"})
-
-        jobs_data = []
-        for result in results:
-            try:
-                details = result.find("div", {"class": "details"})
-                jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
-                jobTitle = details.find("h3").text.strip()
-
-                lista_posizione = [
-                    span.text.strip().title() for span in details.find_next(
-                        string="Sede:").find_next("td").find_next("span").find_all("span")
-                    if span.text.strip()
-                ]
-                jobZone = ' , '.join(lista_posizione)
-                jobSector = details.find_next(string="Settore:").find_next("span").text
-                jobRole = details.find_next(string="Ruolo:").find_next("span").text
-                jobDate = details.find("span", {"class": "date"}).text
-
-                parsed_url = urlparse(jobUrl)
-                params = parse_qs(parsed_url.query)
-                jobID = int(params['id'][0])
-
-                jobs_data.append({
-                    'id': jobID, 'url': jobUrl, 'title': jobTitle,
-                    'zone': jobZone, 'sector': jobSector, 'role': jobRole,
-                    'date': jobDate, 'description_html': None
-                })
-            except Exception as e:
-                print(f"Errore parsing annuncio dalla lista: {e}")
-                continue
-
-        return jobs_data
+        jobs_data = parse_jobs_list_html(main_html)
+        return jobs_data, "selenium"
     finally:
         close_driver_quietly(driver)
 
 
-def scrape_detail_pages(job_urls):
-    """Fase 1b: Apre Chrome solo per le pagine dettaglio dei job NUOVI."""
+def scrape_all_pages():
+    try:
+        return scrape_all_pages_http()
+    except Exception as e:
+        logger.warning("HTTP scraping lista fallito, fallback a Selenium: %s", e)
+        return scrape_all_pages_selenium()
+
+
+def scrape_detail_pages_selenium(job_urls):
+    """Fallback: apre Chrome solo per le pagine dettaglio dei job NUOVI."""
     detail_htmls = {}
     if not job_urls:
-        return detail_htmls
+        return detail_htmls, {
+            "detail_source": "selenium",
+            "requested": 0,
+            "loaded": 0
+        }
 
+    logger.warning("Fallback a Selenium per %s pagine dettaglio.", len(job_urls))
     driver = None
     try:
         for url in job_urls:
@@ -910,7 +1205,7 @@ def scrape_detail_pages(job_urls):
                     detail_htmls[url] = load_page_source(driver, url)
                     break
                 except (TimeoutException, WebDriverException) as e:
-                    print(f"Tentativo {attempt}/2 fallito per caricare il dettaglio {url}: {e}")
+                    logger.warning("Tentativo %s/2 Selenium fallito per il dettaglio %s: %s", attempt, url, e)
                     close_driver_quietly(driver)
                     driver = None
                     if attempt == 2:
@@ -918,27 +1213,97 @@ def scrape_detail_pages(job_urls):
     finally:
         close_driver_quietly(driver)
 
-    return detail_htmls
+    loaded_count = sum(1 for html in detail_htmls.values() if html)
+    return detail_htmls, {
+        "detail_source": "selenium",
+        "requested": len(job_urls),
+        "loaded": loaded_count
+    }
+
+
+def scrape_detail_pages_http(job_urls):
+    detail_htmls = {}
+    if not job_urls:
+        return detail_htmls, {
+            "detail_source": "http",
+            "requested": 0,
+            "loaded": 0
+        }
+
+    session = create_http_session()
+    fallback_urls = []
+    try:
+        for url in job_urls:
+            for attempt in range(1, 3):
+                try:
+                    detail_html = fetch_page_source_http(session, url)
+                    if not is_valid_detail_html(detail_html):
+                        raise ValueError("HTML dettaglio senza contenuto descrittivo atteso")
+                    detail_htmls[url] = detail_html
+                    break
+                except Exception as e:
+                    logger.warning("Tentativo %s/2 HTTP fallito per il dettaglio %s: %s", attempt, url, e)
+                    if attempt == 2:
+                        fallback_urls.append(url)
+
+        if fallback_urls:
+            logger.warning("Fallback Selenium per %s pagine dettaglio.", len(fallback_urls))
+            fallback_htmls, _ = scrape_detail_pages_selenium(fallback_urls)
+            detail_htmls.update(fallback_htmls)
+    finally:
+        session.close()
+
+    loaded_count = sum(1 for html in detail_htmls.values() if html)
+    detail_source = "mixed" if fallback_urls else "http"
+    return detail_htmls, {
+        "detail_source": detail_source,
+        "requested": len(job_urls),
+        "loaded": loaded_count
+    }
+
+
+def scrape_detail_pages(job_urls):
+    try:
+        return scrape_detail_pages_http(job_urls)
+    except Exception as e:
+        logger.warning("HTTP scraping dettagli fallito, fallback a Selenium: %s", e)
+        return scrape_detail_pages_selenium(job_urls)
 
 
 async def scraping():
-    # Fase 1: Scarica lista job (Chrome apre e chiude)
+    # Fase 1: scarica la lista job via HTTP, con fallback Selenium se serve.
+    started_at = time.monotonic()
+    list_source = "unknown"
     for attempt in range(1, 4):
         try:
-            jobs_data = await asyncio.to_thread(scrape_all_pages)
+            jobs_data, list_source = await asyncio.to_thread(scrape_all_pages)
             break
         except Exception as e:
-            print(f"Tentativo {attempt}/3 fallito per caricare la pagina principale: {e}")
+            logger.warning("Tentativo %s/3 fallito per caricare la pagina principale: %s", attempt, e)
             if attempt < 3:
                 await asyncio.sleep(min(attempt * 5, 15))
             else:
-                print("Pagina principale non caricata dopo 3 tentativi. Scraping annullato.")
+                logger.error("SCRAPE_STATUS=failed LIST_SOURCE=%s reason=list_fetch_failed", list_source)
+                await notify_admin_error("scraping: pagina principale non caricata dopo 3 tentativi")
                 return
 
     # Chrome è già chiuso qui - memoria libera
 
+    if not jobs_data:
+        logger.warning(
+            "LIST_SOURCE=%s LIST_COUNT=0. Verifica se il sito ha cambiato markup o se il fetch ha restituito una pagina inattesa.",
+            list_source
+        )
+
     async with db_pool.acquire() as conn:
         users_blocked = []
+        updated_jobs = 0
+        sent_new_jobs = 0
+        detail_stats = {
+            "detail_source": "not_needed",
+            "requested": 0,
+            "loaded": 0
+        }
 
         # Fase 2: Controlla DB per trovare job nuovi vs aggiornati
         new_jobs = []
@@ -952,119 +1317,94 @@ async def scraping():
                         await conn.execute(
                             "UPDATE jobs SET date = $1, sector = $2, role = $3, zone = $4, title = $5 WHERE id = $6",
                             dateDB, job['sector'], job['role'], job['zone'], job['title'], job['id'])
+                        updated_jobs += 1
 
-                        aggiornobuttons = InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text='Visualizza messaggio 🔗',
-                                                 url=f"t.me/concorsiferrovie/{jobDB['idmessage']}"),
-                            InlineKeyboardButton(text='Guadagna 💰',
-                                                 url="https://t.me/concorsiferrovie/1430")
-                        ]])
-
+                        aggiornobuttons = build_updated_job_buttons(jobDB['idmessage'])
                         try:
-                            await bot.send_message(chat_id=CHAT_ID,
-                                                   text=f"""📣 <b>Annuncio aggiornato!</b>
+                            await bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=f"""\U0001F4E3 <b>Annuncio aggiornato!</b>
 
-🔗 <a href='{job['url']}'>{job['title']}</a>
+\U0001F517 <a href='{job['url']}'>{job['title']}</a>
 
-📅 <i>Data aggiornata: {job['date']}</i>""",
-                                                   reply_markup=aggiornobuttons,
-                                                   reply_to_message_id=jobDB['idmessage'],
-                                                   disable_web_page_preview=True)
+\U0001F4C5 <i>Data aggiornata: {job['date']}</i>""",
+                                reply_markup=aggiornobuttons,
+                                reply_to_message_id=jobDB['idmessage'],
+                                disable_web_page_preview=True
+                            )
                         except Exception as e:
-                            print(f"Errore invio messaggio aggiornamento per {job['id']}: {e}")
+                            logger.warning("Errore invio messaggio aggiornamento per %s: %s", job['id'], e)
                 else:
                     new_jobs.append(job)
             except Exception as e:
-                print(f"Errore processando annuncio {job.get('id', '?')}: {e}")
+                logger.warning("Errore processando annuncio %s: %s", job.get('id', '?'), e)
                 continue
 
-        # Fase 3: Solo per i job NUOVI, apri Chrome per le descrizioni
+        # Fase 3: solo per i job nuovi, prova HTTP e usa Selenium solo in fallback.
         if new_jobs:
             new_urls = [j['url'] for j in new_jobs]
-            detail_htmls = await asyncio.to_thread(scrape_detail_pages, new_urls)
-
-            # Chrome è di nuovo chiuso qui
+            detail_htmls, detail_stats = await asyncio.to_thread(scrape_detail_pages, new_urls)
 
             for job in new_jobs:
                 try:
                     detail_html = detail_htmls.get(job['url'])
-                    jobDescription = ""
-                    if detail_html:
-                        soupannuncio = BeautifulSoup(detail_html, 'lxml')
-                        description = (
-                            soupannuncio.find("div", {"itemprop": "description"}) or
-                            soupannuncio.find("div", {"class": "descriptionContainer"}) or
-                            soupannuncio.find("div", {"class": "locationList"})
-                        )
-                        jobDescription = description.text.strip() if description else ""
-                        del soupannuncio, description
+                    detail_data = extract_job_detail_data(detail_html) if detail_html else None
+                    if detail_data is None:
+                        logger.warning("Descrizione non disponibile per job %s, annuncio non pubblicato.", job['id'])
+                        continue
 
                     dateDB = datetime.strptime(job['date'], '%d/%m/%Y').date()
-
-                    telegraph_url = await create_telegraph_page_url(job['title'], jobDescription)
+                    telegraph_url = await create_telegraph_page_url(job['title'], detail_data['description_html'])
                     if not telegraph_url:
-                        print(f"Skipping job {job['id']} because Telegraph page creation failed.")
+                        logger.warning("Telegraph non disponibile per job %s, annuncio saltato.", job['id'])
                         continue
-                    response = {"url": telegraph_url}
 
-                    annunciobuttons = [[
-                        InlineKeyboardButton(
-                            text='Condividi il canale ❗',
-                            url=
-                            "https://telegram.me/share/url?url=https://telegram.me/concorsiferrovie&text=Unisciti%20per%20ricevere%20notifiche%20sulle%20nuove%20posizioni%20disponibili%20sul%20sito%20delle%20Ferrovie%20Dello%20Stato%20"
-                        ),
-                        InlineKeyboardButton(text='Gruppo discussione 🗣',
-                                             url="t.me/selezioniconcorsiferrovie")
-                    ], [InlineKeyboardButton(text='Descrizione 📃', url=f"{response['url']}")],
-                        [InlineKeyboardButton(text='Guadagna 💰',
-                                              url="https://t.me/concorsiferrovie/1430"),
+                    channel_buttons = build_channel_job_buttons(telegraph_url, job['id']).inline_keyboard
+                    channel_message_text = build_channel_message_text(job, detail_data.get('deadline'))
+                    sent_message = await bot.send_message(
+                        CHAT_ID,
+                        channel_message_text,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=channel_buttons),
+                        disable_web_page_preview=True
+                    )
 
-                         InlineKeyboardButton(
-                             text='Aggiungi ai preferiti 🏷',
-                             url="t.me/concorsiferroviebot?start=like_" + str(job['id']) + "")
-                         ]]
-
-                    sentMessage = await bot.send_message(CHAT_ID,
-                                                         f"""🚄 <b>Nuovo annuncio!</b>
-
-🔗 <a href='{job['url']}'>{job['title']}</a>
-
-📍 Sede: <b>{job['zone']}</b>
-💼 Settore: <b>{job['sector']}</b>
-📄 Ruolo: <b>{job['role']}</b>
-
-📅 <i>Data di pubblicazione: {job['date']}</i>""",
-                                                         reply_markup=InlineKeyboardMarkup(
-                                                             inline_keyboard=annunciobuttons),
-                                                         disable_web_page_preview=True)
-
-                    annunciobuttons.append([
-                        InlineKeyboardButton(text="Condividi su WhatsApp 📱", url=url_normalize(
-                            "https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+delle+Ferrovie+Dello+Stato:+"
-                            + job['title'].replace(' ', '+') + "+" + sentMessage.get_url()))
-                    ])
-
-                    message_edited = await bot.edit_message_reply_markup(chat_id=CHAT_ID,
-                                                                         message_id=sentMessage.message_id,
-                                                                         reply_markup=InlineKeyboardMarkup(
-                                                                             inline_keyboard=annunciobuttons))
+                    channel_buttons = build_channel_job_buttons(
+                        telegraph_url, job['id'], sent_message.get_url(), job['title']
+                    ).inline_keyboard
+                    message_edited = await bot.edit_message_reply_markup(
+                        chat_id=CHAT_ID,
+                        message_id=sent_message.message_id,
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=channel_buttons)
+                    )
 
                     await conn.execute(
-                        "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values ($1, $2, $3, $4, $5, "
-                        "$6, $7, $8)",
+                        "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values ($1, $2, $3, $4, $5, $6, $7, $8)",
                         job['id'], dateDB, job['url'], job['title'], job['zone'], job['role'], job['sector'],
-                        sentMessage.message_id)
+                        sent_message.message_id)
+                    sent_new_jobs += 1
 
                     users = await conn.fetch("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
+                    user_ids = [u['iduser'] for u in users]
+                    sectors_by_user = {}
+                    zones_by_user = {}
+                    if user_ids:
+                        user_sectors_rows = await conn.fetch(
+                            "SELECT idUser, type FROM sectors WHERE idUser = ANY($1)",
+                            user_ids
+                        )
+                        user_zones_rows = await conn.fetch(
+                            "SELECT idUser, zone FROM zones WHERE idUser = ANY($1)",
+                            user_ids
+                        )
+                        for row in user_sectors_rows:
+                            sectors_by_user.setdefault(row['iduser'], []).append(row['type'])
+                        for row in user_zones_rows:
+                            zones_by_user.setdefault(row['iduser'], []).append(row['zone'])
 
                     # Notifiche in parallelo
                     async def notify_user(user_id, _job=job, _msg=message_edited):
-                        user_sectors_rows = await conn.fetch(
-                            "SELECT type FROM sectors WHERE idUser = $1", user_id)
-                        user_zones_rows = await conn.fetch(
-                            "SELECT zone FROM zones WHERE idUser = $1", user_id)
-                        user_sectors = [s['type'] for s in user_sectors_rows]
-                        user_zones = [z['zone'] for z in user_zones_rows]
+                        user_sectors = sectors_by_user.get(user_id, [])
+                        user_zones = zones_by_user.get(user_id, [])
 
                         send = False
                         if user_zones and user_sectors:
@@ -1088,13 +1428,12 @@ async def scraping():
                                 users_blocked.append(user_id)
 
                     # Invio notifiche in batch paralleli da 10
-                    user_ids = [u['iduser'] for u in users]
                     for i in range(0, len(user_ids), 10):
                         batch = user_ids[i:i + 10]
                         await asyncio.gather(*[notify_user(uid) for uid in batch])
 
                 except Exception as e:
-                    print(f"Errore processando nuovo annuncio {job.get('id', '?')}: {e}")
+                    logger.exception("Errore processando nuovo annuncio %s", job.get('id', '?'))
                     continue
 
         gc.collect()
@@ -1104,10 +1443,18 @@ async def scraping():
             await conn.execute("DELETE FROM zones WHERE idUser = ANY($1)", users_blocked)
             await conn.execute("DELETE FROM notifications WHERE idUser = ANY($1)", users_blocked)
             await conn.execute("DELETE FROM users WHERE id = ANY($1)", users_blocked)
-    try:
-        await bot.send_message(chat_id=ADMIN_ID, text="Finito scrape")
-    except Exception as e:
-        print(f"Errore invio notifica fine scrape: {e}")
+    logger.info(
+        "SCRAPE_STATUS=ok LIST_SOURCE=%s DETAIL_SOURCE=%s LIST_COUNT=%s NEW_FOUND=%s NEW_SENT=%s UPDATED=%s DETAIL_OK=%s/%s DURATION=%.2fs",
+        list_source,
+        detail_stats["detail_source"],
+        len(jobs_data),
+        len(new_jobs),
+        sent_new_jobs,
+        updated_jobs,
+        detail_stats["loaded"],
+        detail_stats["requested"],
+        time.monotonic() - started_at
+    )
 
 
 # Pulizia Annunci Scaduti
@@ -1116,26 +1463,22 @@ async def clean():
         jobs = await conn.fetch("SELECT * FROM jobs")
 
         delete_list = []
-        session = req_http.Session()
-        session.headers.update({'Accept-Language': 'it-IT,it;q=0.9'})
-
-        for job in jobs:
-            try:
-                resp = await asyncio.to_thread(session.get, job['url'], timeout=15)
-                soup = BeautifulSoup(resp.text, "lxml")
-                if soup.find("div", {"class": "searchTitle"}) is not None:
-                    delete_list.append(job['id'])
-            except Exception:
-                pass
+        session = create_http_session()
+        try:
+            for job in jobs:
+                try:
+                    page_html = await asyncio.to_thread(fetch_page_source_http, session, job['url'])
+                    soup = BeautifulSoup(page_html, "lxml")
+                    if soup.find("div", {"class": "searchTitle"}) is not None:
+                        delete_list.append(job['id'])
+                except Exception as e:
+                    logger.warning("Errore durante clean per job %s: %s", job['id'], e)
+        finally:
+            session.close()
 
         if len(delete_list) > 0:
             await conn.execute("DELETE FROM favorites WHERE idJob = ANY($1)", delete_list)
             await conn.execute("DELETE FROM jobs WHERE id = ANY($1)", delete_list)
-
-    try:
-        await bot.send_message(chat_id=ADMIN_ID, text="Finito clean")
-    except Exception as e:
-        print(f"Errore invio notifica fine clean: {e}")
 
 
 async def safe_clean():
@@ -1143,7 +1486,8 @@ async def safe_clean():
         async with lock:
             await clean()
     except Exception as e:
-        print(f"Errore in safe_clean: {e}")
+        logger.exception("Errore in safe_clean")
+        await notify_admin_error("safe_clean", e)
 
 
 async def safe_scraping():
@@ -1151,7 +1495,8 @@ async def safe_scraping():
         async with lock:
             await scraping()
     except Exception as e:
-        print(f"Errore in safe_scraping: {e}")
+        logger.exception("Errore in safe_scraping")
+        await notify_admin_error("safe_scraping", e)
 
 
 async def main():
@@ -1159,7 +1504,7 @@ async def main():
 
     scheduler = AsyncIOScheduler(timezone="Europe/Rome")
     scheduler.add_job(safe_clean, "cron", hour=1, misfire_grace_time=300)
-    scheduler.add_job(safe_scraping, "interval", minutes=10, next_run_time=datetime.now() + timedelta(seconds=10))
+    scheduler.add_job(safe_scraping, "interval", minutes=1, next_run_time=datetime.now() + timedelta(seconds=10))
     scheduler.start()
 
     keep_alive()
