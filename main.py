@@ -49,11 +49,16 @@ def build_chrome_options():
     options.add_argument("--disable-renderer-backgrounding")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--remote-debugging-pipe")
+    options.add_argument("--js-flags=--max-old-space-size=128")
+    options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+    options.add_argument("--disable-ipc-flooding-protection")
+    options.add_argument("--disable-backgrounding-occluded-windows")
     options.page_load_strategy = "eager"
     return options
 
 
 def create_chrome_driver():
+    gc.collect()
     driver = webdriver.Chrome(options=build_chrome_options())
     driver.set_page_load_timeout(60)
     driver.set_script_timeout(30)
@@ -67,6 +72,7 @@ def close_driver_quietly(driver):
         driver.quit()
     except Exception:
         pass
+    gc.collect()
 
 
 def load_page_source(driver, url, wait_locators=None):
