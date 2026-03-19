@@ -15,4 +15,6 @@ RUN apt-get update -y \
 
 COPY . .
 
+ENV PYTHONUNBUFFERED=1
+
 CMD [ "python", "-u", "./main.py" ]

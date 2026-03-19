@@ -29,7 +29,7 @@ import gc
 load_dotenv()
 
 chrome_options = webdriver.ChromeOptions()
-chrome_options.add_argument("--headless")
+chrome_options.add_argument("--headless=new")
 chrome_options.add_argument("--disable-gpu")
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
@@ -40,6 +40,12 @@ chrome_options.add_argument("--disable-sync")
 chrome_options.add_argument("--no-first-run")
 chrome_options.add_argument("--disable-default-apps")
 chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+chrome_options.add_argument("--window-size=1280,720")
+chrome_options.add_argument("--single-process")
+chrome_options.add_argument("--disable-renderer-backgrounding")
+chrome_options.add_argument("--disable-software-rasterizer")
+chrome_options.add_argument("--js-flags=--max-old-space-size=256")
+chrome_options.page_load_strategy = 'eager'
 
 telegraph = Telegraph()
 try:
@@ -787,224 +793,280 @@ async def elimina(message: Message):
 
 
 # Scraping
-async def scraping():
+def scrape_all_pages():
+    """Fase 1: Chrome scarica tutto l'HTML, poi viene chiuso. Niente async qui."""
     driver = webdriver.Chrome(options=chrome_options)
+    driver.set_page_load_timeout(60)
+    driver.set_script_timeout(30)
     try:
-        async with db_pool.acquire() as conn:
-            users_blocked = []
+        # Carica pagina lista
+        driver.get(DOMAIN + "jobs.php")
+        driver.implicitly_wait(10)
+        driver.delete_cookie('lang')
+        driver.add_cookie({
+            'name': 'lang',
+            'value': 'it_IT',
+            'domain': '.fscareers.gruppofs.it',
+            'path': '/',
+            'secure': True,
+            'httpOnly': True,
+            'sameSite': 'None'
+        })
+        driver.refresh()
+        wait = WebDriverWait(driver, 20)
+        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "searchResultsBody")))
+        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "singleResult")))
+        main_html = driver.page_source
 
-            # Retry per caricare la pagina principale
-            page_loaded = False
-            for attempt in range(1, 4):
-                try:
-                    driver.get(DOMAIN + "jobs.php")
-                    driver.implicitly_wait(10)
-                    driver.delete_cookie('lang')
-                    driver.add_cookie({
-                        'name': 'lang',
-                        'value': 'it_IT',
-                        'domain': '.fscareers.gruppofs.it',
-                        'path': '/',
-                        'secure': True,
-                        'httpOnly': True,
-                        'sameSite': 'None'
-                    })
-                    driver.refresh()
+        # Estrai URL dei job dalla lista
+        soup = BeautifulSoup(main_html, "lxml")
+        results = soup.find("div", {"class": "searchResultsBody"}).find_all(
+            "div", {"class": "singleResult responsiveOnly"})
 
-                    wait = WebDriverWait(driver, 20)
-                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "searchResultsBody")))
-                    wait.until(EC.presence_of_element_located((By.CLASS_NAME, "singleResult")))
-                    page_loaded = True
-                    break
-                except Exception as e:
-                    print(f"Tentativo {attempt}/3 fallito per caricare la pagina principale: {e}")
-                    if attempt < 3:
-                        await asyncio.sleep(min(attempt * 5, 15))
+        jobs_data = []
+        for result in results:
+            try:
+                details = result.find("div", {"class": "details"})
+                jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
+                jobTitle = details.find("h3").text.strip()
 
-            if not page_loaded:
+                lista_posizione = [
+                    span.text.strip().title() for span in details.find_next(
+                        string="Sede:").find_next("td").find_next("span").find_all("span")
+                    if span.text.strip()
+                ]
+                jobZone = ' , '.join(lista_posizione)
+                jobSector = details.find_next(string="Settore:").find_next("span").text
+                jobRole = details.find_next(string="Ruolo:").find_next("span").text
+                jobDate = details.find("span", {"class": "date"}).text
+
+                parsed_url = urlparse(jobUrl)
+                params = parse_qs(parsed_url.query)
+                jobID = int(params['id'][0])
+
+                jobs_data.append({
+                    'id': jobID, 'url': jobUrl, 'title': jobTitle,
+                    'zone': jobZone, 'sector': jobSector, 'role': jobRole,
+                    'date': jobDate, 'description_html': None
+                })
+            except Exception as e:
+                print(f"Errore parsing annuncio dalla lista: {e}")
+                continue
+
+        return jobs_data
+    finally:
+        driver.quit()
+
+
+def scrape_detail_pages(job_urls):
+    """Fase 1b: Apre Chrome solo per le pagine dettaglio dei job NUOVI."""
+    detail_htmls = {}
+    if not job_urls:
+        return detail_htmls
+
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.set_page_load_timeout(60)
+    driver.set_script_timeout(30)
+    try:
+        for url in job_urls:
+            try:
+                driver.get(url)
+                driver.implicitly_wait(10)
+                driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
+                driver.refresh()
+                detail_htmls[url] = driver.page_source
+            except Exception as e:
+                print(f"Errore caricamento dettaglio {url}: {e}")
+                detail_htmls[url] = None
+    finally:
+        driver.quit()
+
+    return detail_htmls
+
+
+async def scraping():
+    # Fase 1: Scarica lista job (Chrome apre e chiude)
+    for attempt in range(1, 4):
+        try:
+            jobs_data = await asyncio.to_thread(scrape_all_pages)
+            break
+        except Exception as e:
+            print(f"Tentativo {attempt}/3 fallito per caricare la pagina principale: {e}")
+            if attempt < 3:
+                await asyncio.sleep(min(attempt * 5, 15))
+            else:
                 print("Pagina principale non caricata dopo 3 tentativi. Scraping annullato.")
                 return
 
-            soup = BeautifulSoup(driver.page_source, "lxml")
+    # Chrome è già chiuso qui - memoria libera
 
-            results = soup.find("div", {
-                "class": "searchResultsBody"
-            }).find_all("div", {"class": "singleResult responsiveOnly"})
+    async with db_pool.acquire() as conn:
+        users_blocked = []
 
-            for result in results:
+        # Fase 2: Controlla DB per trovare job nuovi vs aggiornati
+        new_jobs = []
+        for job in jobs_data:
+            try:
+                dateDB = datetime.strptime(job['date'], '%d/%m/%Y').date()
+                jobDB = await conn.fetchrow("SELECT * FROM jobs WHERE id = $1", job['id'])
+
+                if jobDB is not None:
+                    if jobDB['date'] != dateDB:
+                        await conn.execute(
+                            "UPDATE jobs SET date = $1, sector = $2, role = $3, zone = $4, title = $5 WHERE id = $6",
+                            dateDB, job['sector'], job['role'], job['zone'], job['title'], job['id'])
+
+                        aggiornobuttons = InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text='Visualizza messaggio 🔗',
+                                                 url=f"t.me/concorsiferrovie/{jobDB['idmessage']}"),
+                            InlineKeyboardButton(text='Guadagna 💰',
+                                                 url="https://t.me/concorsiferrovie/1430")
+                        ]])
+
+                        try:
+                            await bot.send_message(chat_id=CHAT_ID,
+                                                   text=f"""📣 <b>Annuncio aggiornato!</b>
+
+🔗 <a href='{job['url']}'>{job['title']}</a>
+
+📅 <i>Data aggiornata: {job['date']}</i>""",
+                                                   reply_markup=aggiornobuttons,
+                                                   reply_to_message_id=jobDB['idmessage'],
+                                                   disable_web_page_preview=True)
+                        except Exception as e:
+                            print(f"Errore invio messaggio aggiornamento per {job['id']}: {e}")
+                else:
+                    new_jobs.append(job)
+            except Exception as e:
+                print(f"Errore processando annuncio {job.get('id', '?')}: {e}")
+                continue
+
+        # Fase 3: Solo per i job NUOVI, apri Chrome per le descrizioni
+        if new_jobs:
+            new_urls = [j['url'] for j in new_jobs]
+            detail_htmls = await asyncio.to_thread(scrape_detail_pages, new_urls)
+
+            # Chrome è di nuovo chiuso qui
+
+            for job in new_jobs:
                 try:
-                    details = result.find("div", {"class": "details"})
-
-                    jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
-                    jobTitle = details.find("h3").text.strip()
-
-                    lista_posizione = [
-                        span.text.strip().title() for span in details.find_next(
-                            string="Sede:").find_next("td").find_next("span").find_all("span")
-                        if span.text.strip()
-                    ]
-
-                    jobZone = ' , '.join(lista_posizione)
-
-                    driver.get(jobUrl)
-                    driver.implicitly_wait(10)
-                    driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
-                    driver.refresh()
-
-                    soupannuncio = BeautifulSoup(driver.page_source, 'lxml')
-
-                    description = (
+                    detail_html = detail_htmls.get(job['url'])
+                    jobDescription = ""
+                    if detail_html:
+                        soupannuncio = BeautifulSoup(detail_html, 'lxml')
+                        description = (
                             soupannuncio.find("div", {"itemprop": "description"}) or
                             soupannuncio.find("div", {"class": "descriptionContainer"}) or
                             soupannuncio.find("div", {"class": "locationList"})
-                    )
-                    jobDescription = description.text.strip() if description else ""
-                    del soupannuncio, description
+                        )
+                        jobDescription = description.text.strip() if description else ""
+                        del soupannuncio, description
 
-                    jobSector = details.find_next(string="Settore:").find_next("span").text
-                    jobRole = details.find_next(string="Ruolo:").find_next("span").text
+                    dateDB = datetime.strptime(job['date'], '%d/%m/%Y').date()
 
-                    jobDate = details.find("span", {"class": "date"}).text
+                    telegraph_url = await create_telegraph_page_url(job['title'], jobDescription)
+                    if not telegraph_url:
+                        print(f"Skipping job {job['id']} because Telegraph page creation failed.")
+                        continue
+                    response = {"url": telegraph_url}
 
-                    dateDB = datetime.strptime(jobDate, '%d/%m/%Y').date()
+                    annunciobuttons = [[
+                        InlineKeyboardButton(
+                            text='Condividi il canale ❗',
+                            url=
+                            "https://telegram.me/share/url?url=https://telegram.me/concorsiferrovie&text=Unisciti%20per%20ricevere%20notifiche%20sulle%20nuove%20posizioni%20disponibili%20sul%20sito%20delle%20Ferrovie%20Dello%20Stato%20"
+                        ),
+                        InlineKeyboardButton(text='Gruppo discussione 🗣',
+                                             url="t.me/selezioniconcorsiferrovie")
+                    ], [InlineKeyboardButton(text='Descrizione 📃', url=f"{response['url']}")],
+                        [InlineKeyboardButton(text='Guadagna 💰',
+                                              url="https://t.me/concorsiferrovie/1430"),
 
-                    parsed_url = urlparse(jobUrl)
-                    params = parse_qs(parsed_url.query)
-                    jobID = int(params['id'][0])
+                         InlineKeyboardButton(
+                             text='Aggiungi ai preferiti 🏷',
+                             url="t.me/concorsiferroviebot?start=like_" + str(job['id']) + "")
+                         ]]
 
-                    jobDB = await conn.fetchrow("SELECT * FROM jobs WHERE id = $1", jobID)
+                    sentMessage = await bot.send_message(CHAT_ID,
+                                                         f"""🚄 <b>Nuovo annuncio!</b>
 
-                    if jobDB is not None:
-                        if jobDB['date'] != dateDB:
-                            await conn.execute(
-                                "UPDATE jobs SET date = $1, sector = $2, role = $3, zone = $4, title = $5 WHERE id = $6",
-                                dateDB, jobSector, jobRole, jobZone, jobTitle, jobID)
+🔗 <a href='{job['url']}'>{job['title']}</a>
 
-                            aggiornobuttons = InlineKeyboardMarkup(inline_keyboard=[[
-                                InlineKeyboardButton(text='Visualizza messaggio 🔗',
-                                                     url=f"t.me/concorsiferrovie/{jobDB['idmessage']}"),
-                                InlineKeyboardButton(text='Guadagna 💰',
-                                                     url="https://t.me/concorsiferrovie/1430")
-                            ]])
+📍 Sede: <b>{job['zone']}</b>
+💼 Settore: <b>{job['sector']}</b>
+📄 Ruolo: <b>{job['role']}</b>
 
-                            try:
-                                await bot.send_message(chat_id=CHAT_ID,
-                                                       text=f"""📣 <b>Annuncio aggiornato!</b>
+📅 <i>Data di pubblicazione: {job['date']}</i>""",
+                                                         reply_markup=InlineKeyboardMarkup(
+                                                             inline_keyboard=annunciobuttons),
+                                                         disable_web_page_preview=True)
 
-🔗 <a href='{jobUrl}'>{jobTitle}</a>
+                    annunciobuttons.append([
+                        InlineKeyboardButton(text="Condividi su WhatsApp 📱", url=url_normalize(
+                            "https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+delle+Ferrovie+Dello+Stato:+"
+                            + job['title'].replace(' ', '+') + "+" + sentMessage.get_url()))
+                    ])
 
-📅 <i>Data aggiornata: {jobDate}</i>""",
-                                                       reply_markup=aggiornobuttons,
-                                                       reply_to_message_id=jobDB['idmessage'],
-                                                       disable_web_page_preview=True)
-                            except Exception as e:
-                                print(f"Errore invio messaggio aggiornamento per {jobID}: {e}")
+                    message_edited = await bot.edit_message_reply_markup(chat_id=CHAT_ID,
+                                                                         message_id=sentMessage.message_id,
+                                                                         reply_markup=InlineKeyboardMarkup(
+                                                                             inline_keyboard=annunciobuttons))
 
-                    else:
-                        telegraph_url = await create_telegraph_page_url(jobTitle, jobDescription)
-                        if not telegraph_url:
-                            print(f"Skipping job {jobID} because Telegraph page creation failed.")
-                            continue
-                        response = {"url": telegraph_url}
+                    await conn.execute(
+                        "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values ($1, $2, $3, $4, $5, "
+                        "$6, $7, $8)",
+                        job['id'], dateDB, job['url'], job['title'], job['zone'], job['role'], job['sector'],
+                        sentMessage.message_id)
 
-                        annunciobuttons = [[
-                            InlineKeyboardButton(
-                                text='Condividi il canale ❗',
-                                url=
-                                "https://telegram.me/share/url?url=https://telegram.me/concorsiferrovie&text=Unisciti%20per%20ricevere%20notifiche%20sulle%20nuove%20posizioni%20disponibili%20sul%20sito%20delle%20Ferrovie%20Dello%20Stato%20"
-                            ),
-                            InlineKeyboardButton(text='Gruppo discussione 🗣',
-                                                 url="t.me/selezioniconcorsiferrovie")
-                        ], [InlineKeyboardButton(text='Descrizione 📃', url=f"{response['url']}")],
-                            [InlineKeyboardButton(text='Guadagna 💰',
-                                                  url="https://t.me/concorsiferrovie/1430"),
+                    users = await conn.fetch("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
 
-                             InlineKeyboardButton(
-                                 text='Aggiungi ai preferiti 🏷',
-                                 url="t.me/concorsiferroviebot?start=like_" + str(jobID) + "")
-                             ]]
+                    # Notifiche in parallelo
+                    async def notify_user(user_id, _job=job, _msg=message_edited):
+                        user_sectors_rows = await conn.fetch(
+                            "SELECT type FROM sectors WHERE idUser = $1", user_id)
+                        user_zones_rows = await conn.fetch(
+                            "SELECT zone FROM zones WHERE idUser = $1", user_id)
+                        user_sectors = [s['type'] for s in user_sectors_rows]
+                        user_zones = [z['zone'] for z in user_zones_rows]
 
-                        sentMessage = await bot.send_message(CHAT_ID,
-                                                             f"""🚄 <b>Nuovo annuncio!</b>
-
-🔗 <a href='{jobUrl}'>{jobTitle}</a>
-
-📍 Sede: <b>{jobZone}</b>
-💼 Settore: <b>{jobSector}</b>
-📄 Ruolo: <b>{jobRole}</b>
-
-📅 <i>Data di pubblicazione: {jobDate}</i>""",
-                                                             reply_markup=InlineKeyboardMarkup(
-                                                                 inline_keyboard=annunciobuttons),
-                                                             disable_web_page_preview=True)
-
-                        annunciobuttons.append([
-                            InlineKeyboardButton(text="Condividi su WhatsApp 📱", url=url_normalize(
-                                "https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+delle+Ferrovie+Dello+Stato:+"
-                                + jobTitle.replace(' ', '+') + "+" + sentMessage.get_url()))
-                        ])
-
-                        message_edited = await bot.edit_message_reply_markup(chat_id=CHAT_ID,
-                                                                             message_id=sentMessage.message_id,
-                                                                             reply_markup=InlineKeyboardMarkup(
-                                                                                 inline_keyboard=annunciobuttons))
-
-                        await conn.execute(
-                            "INSERT INTO jobs(id, date, url, title, zone, role, sector, idmessage) values ($1, $2, $3, $4, $5, "
-                            "$6, $7, $8)",
-                            jobID, dateDB, jobUrl, jobTitle, jobZone, jobRole, jobSector, sentMessage.message_id)
-
-                        users = await conn.fetch("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
-
-                        # Notifiche in parallelo
-                        async def notify_user(user_id):
-                            user_sectors_rows = await conn.fetch(
-                                "SELECT type FROM sectors WHERE idUser = $1", user_id)
-                            user_zones_rows = await conn.fetch(
-                                "SELECT zone FROM zones WHERE idUser = $1", user_id)
-                            user_sectors = [s['type'] for s in user_sectors_rows]
-                            user_zones = [z['zone'] for z in user_zones_rows]
-
-                            send = False
-                            if user_zones and user_sectors:
-                                if jobSector in user_sectors and any(
-                                        z in jobZone for z in user_zones):
-                                    send = True
-                            elif user_zones:
-                                if any(z in jobZone for z in user_zones):
-                                    send = True
-                            elif user_sectors:
-                                if jobSector in user_sectors:
-                                    send = True
-                            else:
+                        send = False
+                        if user_zones and user_sectors:
+                            if _job['sector'] in user_sectors and any(
+                                    z in _job['zone'] for z in user_zones):
                                 send = True
-                            if send:
-                                try:
-                                    await bot.forward_message(chat_id=user_id,
-                                                              from_chat_id=CHAT_ID,
-                                                              message_id=message_edited.message_id)
-                                except Exception:
-                                    users_blocked.append(user_id)
+                        elif user_zones:
+                            if any(z in _job['zone'] for z in user_zones):
+                                send = True
+                        elif user_sectors:
+                            if _job['sector'] in user_sectors:
+                                send = True
+                        else:
+                            send = True
+                        if send:
+                            try:
+                                await bot.forward_message(chat_id=user_id,
+                                                          from_chat_id=CHAT_ID,
+                                                          message_id=_msg.message_id)
+                            except Exception:
+                                users_blocked.append(user_id)
 
-                        # Invio notifiche in batch paralleli da 10
-                        user_ids = [u['iduser'] for u in users]
-                        for i in range(0, len(user_ids), 10):
-                            batch = user_ids[i:i + 10]
-                            await asyncio.gather(*[notify_user(uid) for uid in batch])
+                    # Invio notifiche in batch paralleli da 10
+                    user_ids = [u['iduser'] for u in users]
+                    for i in range(0, len(user_ids), 10):
+                        batch = user_ids[i:i + 10]
+                        await asyncio.gather(*[notify_user(uid) for uid in batch])
 
                 except Exception as e:
-                    print(f"Errore processando annuncio: {e}")
+                    print(f"Errore processando nuovo annuncio {job.get('id', '?')}: {e}")
                     continue
-            del soup, results
-            gc.collect()
-            if len(users_blocked) > 0:
-                await conn.execute("DELETE FROM favorites WHERE idUser = ANY($1)", users_blocked)
-                await conn.execute("DELETE FROM sectors WHERE idUser = ANY($1)", users_blocked)
-                await conn.execute("DELETE FROM zones WHERE idUser = ANY($1)", users_blocked)
-                await conn.execute("DELETE FROM notifications WHERE idUser = ANY($1)", users_blocked)
-                await conn.execute("DELETE FROM users WHERE id = ANY($1)", users_blocked)
-    finally:
-        driver.quit()
+
+        gc.collect()
+        if len(users_blocked) > 0:
+            await conn.execute("DELETE FROM favorites WHERE idUser = ANY($1)", users_blocked)
+            await conn.execute("DELETE FROM sectors WHERE idUser = ANY($1)", users_blocked)
+            await conn.execute("DELETE FROM zones WHERE idUser = ANY($1)", users_blocked)
+            await conn.execute("DELETE FROM notifications WHERE idUser = ANY($1)", users_blocked)
+            await conn.execute("DELETE FROM users WHERE id = ANY($1)", users_blocked)
     try:
         await bot.send_message(chat_id=ADMIN_ID, text="Finito scrape")
     except Exception as e:
