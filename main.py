@@ -17,6 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
@@ -28,24 +29,64 @@ import gc
 
 load_dotenv()
 
-chrome_options = webdriver.ChromeOptions()
-chrome_options.add_argument("--headless=new")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--disable-extensions")
-chrome_options.add_argument("--disable-plugins")
-chrome_options.add_argument("--disable-background-networking")
-chrome_options.add_argument("--disable-sync")
-chrome_options.add_argument("--no-first-run")
-chrome_options.add_argument("--disable-default-apps")
-chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-chrome_options.add_argument("--window-size=1280,720")
-chrome_options.add_argument("--single-process")
-chrome_options.add_argument("--disable-renderer-backgrounding")
-chrome_options.add_argument("--disable-software-rasterizer")
-chrome_options.add_argument("--js-flags=--max-old-space-size=256")
-chrome_options.page_load_strategy = 'eager'
+LANG_COOKIE = {"name": "lang", "value": "it_IT"}
+
+
+def build_chrome_options():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-sync")
+    options.add_argument("--no-first-run")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--window-size=1280,720")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--remote-debugging-pipe")
+    options.page_load_strategy = "eager"
+    return options
+
+
+def create_chrome_driver():
+    driver = webdriver.Chrome(options=build_chrome_options())
+    driver.set_page_load_timeout(60)
+    driver.set_script_timeout(30)
+    return driver
+
+
+def close_driver_quietly(driver):
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
+def load_page_source(driver, url, wait_locators=None):
+    driver.get(url)
+    driver.implicitly_wait(10)
+
+    try:
+        driver.delete_cookie(LANG_COOKIE["name"])
+    except WebDriverException:
+        pass
+
+    driver.add_cookie(LANG_COOKIE.copy())
+    driver.refresh()
+
+    if wait_locators:
+        wait = WebDriverWait(driver, 20)
+        for locator in wait_locators:
+            wait.until(EC.presence_of_element_located(locator))
+
+    return driver.page_source
 
 telegraph = Telegraph()
 try:
@@ -795,28 +836,17 @@ async def elimina(message: Message):
 # Scraping
 def scrape_all_pages():
     """Fase 1: Chrome scarica tutto l'HTML, poi viene chiuso. Niente async qui."""
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.set_page_load_timeout(60)
-    driver.set_script_timeout(30)
+    driver = None
     try:
-        # Carica pagina lista
-        driver.get(DOMAIN + "jobs.php")
-        driver.implicitly_wait(10)
-        driver.delete_cookie('lang')
-        driver.add_cookie({
-            'name': 'lang',
-            'value': 'it_IT',
-            'domain': '.fscareers.gruppofs.it',
-            'path': '/',
-            'secure': True,
-            'httpOnly': True,
-            'sameSite': 'None'
-        })
-        driver.refresh()
-        wait = WebDriverWait(driver, 20)
-        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "searchResultsBody")))
-        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "singleResult")))
-        main_html = driver.page_source
+        driver = create_chrome_driver()
+        main_html = load_page_source(
+            driver,
+            DOMAIN + "jobs.php",
+            wait_locators=[
+                (By.CLASS_NAME, "searchResultsBody"),
+                (By.CLASS_NAME, "singleResult")
+            ]
+        )
 
         # Estrai URL dei job dalla lista
         soup = BeautifulSoup(main_html, "lxml")
@@ -855,7 +885,7 @@ def scrape_all_pages():
 
         return jobs_data
     finally:
-        driver.quit()
+        close_driver_quietly(driver)
 
 
 def scrape_detail_pages(job_urls):
@@ -864,22 +894,23 @@ def scrape_detail_pages(job_urls):
     if not job_urls:
         return detail_htmls
 
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.set_page_load_timeout(60)
-    driver.set_script_timeout(30)
+    driver = None
     try:
         for url in job_urls:
-            try:
-                driver.get(url)
-                driver.implicitly_wait(10)
-                driver.add_cookie({'name': 'lang', 'value': 'it_IT'})
-                driver.refresh()
-                detail_htmls[url] = driver.page_source
-            except Exception as e:
-                print(f"Errore caricamento dettaglio {url}: {e}")
-                detail_htmls[url] = None
+            for attempt in range(1, 3):
+                try:
+                    if driver is None:
+                        driver = create_chrome_driver()
+                    detail_htmls[url] = load_page_source(driver, url)
+                    break
+                except (TimeoutException, WebDriverException) as e:
+                    print(f"Tentativo {attempt}/2 fallito per caricare il dettaglio {url}: {e}")
+                    close_driver_quietly(driver)
+                    driver = None
+                    if attempt == 2:
+                        detail_htmls[url] = None
     finally:
-        driver.quit()
+        close_driver_quietly(driver)
 
     return detail_htmls
 
