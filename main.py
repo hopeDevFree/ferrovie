@@ -377,7 +377,7 @@ def format_job_date(value):
 
 
 def build_channel_message_text(job, deadline=None, header="\U0001F686 <b>Nuovo annuncio!</b>"):
-    deadline_line = f"\\n\u23F3 <i>Data di scadenza: {deadline}</i>" if deadline else ""
+    deadline_line = f"\n\u23F3 <i>Data di scadenza: {deadline}</i>" if deadline else ""
     publication_date = format_job_date(job["date"])
     return f"""{header}
 
