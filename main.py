@@ -1459,26 +1459,34 @@ async def scraping():
 
 # Pulizia Annunci Scaduti
 async def clean():
+    started_at = time.monotonic()
+    try:
+        jobs_data, list_source = await asyncio.to_thread(scrape_all_pages)
+    except Exception as e:
+        logger.warning("Clean saltato: impossibile caricare la lista annunci: %s", e)
+        return
+
+    if not jobs_data:
+        logger.warning("Clean saltato: lista annunci vuota o non parsabile.")
+        return
+
+    active_job_ids = {job["id"] for job in jobs_data}
+
     async with db_pool.acquire() as conn:
-        jobs = await conn.fetch("SELECT * FROM jobs")
+        jobs = await conn.fetch("SELECT id FROM jobs")
+        delete_list = [job["id"] for job in jobs if job["id"] not in active_job_ids]
 
-        delete_list = []
-        session = create_http_session()
-        try:
-            for job in jobs:
-                try:
-                    page_html = await asyncio.to_thread(fetch_page_source_http, session, job['url'])
-                    soup = BeautifulSoup(page_html, "lxml")
-                    if soup.find("div", {"class": "searchTitle"}) is not None:
-                        delete_list.append(job['id'])
-                except Exception as e:
-                    logger.warning("Errore durante clean per job %s: %s", job['id'], e)
-        finally:
-            session.close()
-
-        if len(delete_list) > 0:
+        if delete_list:
             await conn.execute("DELETE FROM favorites WHERE idJob = ANY($1)", delete_list)
             await conn.execute("DELETE FROM jobs WHERE id = ANY($1)", delete_list)
+
+    logger.info(
+        "CLEAN_STATUS=ok LIST_SOURCE=%s LIST_COUNT=%s REMOVED=%s DURATION=%.2fs",
+        list_source,
+        len(jobs_data),
+        len(delete_list),
+        time.monotonic() - started_at
+    )
 
 
 async def safe_clean():
