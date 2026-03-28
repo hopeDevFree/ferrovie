@@ -13,17 +13,13 @@ from aiogram.types import (
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from telegraph import Telegraph
+from telegraph.exceptions import RetryAfterError
 from url_normalize import url_normalize
 import os
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
 from keep_alive import keep_alive
 import asyncpg
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
@@ -40,6 +36,7 @@ logger = logging.getLogger("ferrovie")
 
 LANG_COOKIE = {"name": "lang", "value": "it_IT"}
 HTTP_TIMEOUT = 30
+TELEGRAPH_TIMEOUT = 15
 HTTP_HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9",
     "User-Agent": (
@@ -65,67 +62,14 @@ ITALIAN_MONTHS = {
 }
 
 
-def build_chrome_options():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-plugins")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-sync")
-    options.add_argument("--no-first-run")
-    options.add_argument("--disable-default-apps")
-    options.add_argument("--blink-settings=imagesEnabled=false")
-    options.add_argument("--window-size=1280,720")
-    options.add_argument("--disable-renderer-backgrounding")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--remote-debugging-pipe")
-    options.add_argument("--js-flags=--max-old-space-size=128")
-    options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-    options.add_argument("--disable-ipc-flooding-protection")
-    options.add_argument("--disable-backgrounding-occluded-windows")
-    options.page_load_strategy = "eager"
-    return options
+class TimeoutSession(req_http.Session):
+    def __init__(self, timeout):
+        super().__init__()
+        self.default_timeout = timeout
 
-
-def create_chrome_driver():
-    gc.collect()
-    driver = webdriver.Chrome(options=build_chrome_options())
-    driver.set_page_load_timeout(60)
-    driver.set_script_timeout(30)
-    return driver
-
-
-def close_driver_quietly(driver):
-    if driver is None:
-        return
-    try:
-        driver.quit()
-    except Exception:
-        pass
-    gc.collect()
-
-
-def load_page_source(driver, url, wait_locators=None):
-    driver.get(url)
-    driver.implicitly_wait(10)
-
-    try:
-        driver.delete_cookie(LANG_COOKIE["name"])
-    except WebDriverException:
-        pass
-
-    driver.add_cookie(LANG_COOKIE.copy())
-    driver.refresh()
-
-    if wait_locators:
-        wait = WebDriverWait(driver, 20)
-        for locator in wait_locators:
-            wait.until(EC.presence_of_element_located(locator))
-
-    return driver.page_source
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", self.default_timeout)
+        return super().request(*args, **kwargs)
 
 
 def create_http_session():
@@ -166,6 +110,17 @@ def get_description_node(soup):
             soup.find("div", {"class": "descriptionContainer"}) or
             soup.find("div", {"class": "locationList"})
     )
+
+
+def is_offline_job_page(soup):
+    search_titles = soup.find_all("div", {"class": "searchTitle"})
+    for node in search_titles:
+        text = node.get_text(" ", strip=True).lower()
+        if "annuncio di lavoro" in text and "offline" in text:
+            return True
+        if "job ad" in text and "offline" in text:
+            return True
+    return False
 
 
 def parse_jobs_list_html(main_html):
@@ -210,7 +165,7 @@ def parse_jobs_list_html(main_html):
 
 def is_valid_detail_html(detail_html):
     soup = BeautifulSoup(detail_html, "lxml")
-    return get_description_node(soup) is not None
+    return get_description_node(soup) is not None and not is_offline_job_page(soup)
 
 
 def extract_deadline_from_text(text):
@@ -263,6 +218,8 @@ def sanitize_description_html(description_node):
 
 def extract_job_detail_data(detail_html):
     soup = BeautifulSoup(detail_html, "lxml")
+    if is_offline_job_page(soup):
+        return None
     description_node = get_description_node(soup)
     if description_node is None:
         return None
@@ -280,6 +237,7 @@ def extract_job_detail_data(detail_html):
 
 
 telegraph = Telegraph()
+telegraph._telegraph.session = TimeoutSession(TELEGRAPH_TIMEOUT)
 try:
     telegraph.create_account("@ConcorsiFerrovie")
 except Exception as e:
@@ -330,7 +288,8 @@ def build_start_message_buttons():
         [InlineKeyboardButton(text="Canale notifiche \u2757", url="t.me/concorsiferrovie"),
          InlineKeyboardButton(text="Gruppo discussione \U0001F5E3", url="t.me/selezioniconcorsiferrovie")],
         [InlineKeyboardButton(text="Ultime posizioni \U0001F4C5", callback_data="ultime")],
-        [InlineKeyboardButton(text="Lista per settore \U0001F477\U0001F3FB\u200d\u2642\ufe0f", callback_data="listasettore"),
+        [InlineKeyboardButton(text="Lista per settore \U0001F477\U0001F3FB\u200d\u2642\ufe0f",
+                              callback_data="listasettore"),
          InlineKeyboardButton(text="Lista per regione \U0001F4CD", callback_data="listaregioni")],
         [InlineKeyboardButton(text="Cerca \U0001F50D", callback_data="ricerca")],
         [InlineKeyboardButton(text="Profilo \U0001F464", callback_data="profilo"),
@@ -354,7 +313,8 @@ def build_channel_job_buttons(description_url, job_id, whatsapp_url=None, whatsa
         InlineKeyboardButton(text="Descrizione \U0001F4C3", url=description_url)
     ], [
         InlineKeyboardButton(text="Guadagna \U0001F4B0", url="https://t.me/concorsiferrovie/1430"),
-        InlineKeyboardButton(text="Aggiungi ai preferiti \U0001F3F7", url=f"t.me/concorsiferroviebot?start=like_{job_id}")
+        InlineKeyboardButton(text="Aggiungi ai preferiti \U0001F3F7",
+                             url=f"t.me/concorsiferroviebot?start=like_{job_id}")
     ]]
 
     if whatsapp_url:
@@ -402,6 +362,7 @@ def fetch_latest_job_snapshot():
 
     return latest_job, detail_data, list_source
 
+
 async def create_telegraph_page_url(title, html_content, retries=3):
     if not html_content or not html_content.strip():
         return None
@@ -416,6 +377,17 @@ async def create_telegraph_page_url(title, html_content, retries=3):
                 html_content=html_content
             )
             return response["url"]
+        except RetryAfterError as exc:
+            last_error = exc
+            logger.warning(
+                "Telegraph flood wait per '%s': retry_after=%ss",
+                title,
+                exc.retry_after
+            )
+            if attempt < retries and exc.retry_after <= 5:
+                await asyncio.sleep(exc.retry_after)
+            else:
+                break
         except Exception as exc:
             last_error = exc
             logger.warning("Telegraph create_page fallito (%s/%s) per '%s': %s", attempt, retries, title, exc)
@@ -547,13 +519,15 @@ async def test_command(message: Message):
         return
 
     reply_markup = build_channel_job_buttons(telegraph_url, job['id'])
-    text = build_channel_message_text(job, detail_data.get('deadline'), header="\U0001F9EA <b>Anteprima annuncio live</b>")
+    text = build_channel_message_text(job, detail_data.get('deadline'),
+                                      header="\U0001F9EA <b>Anteprima annuncio live</b>")
 
     await message.answer(
         text=text,
         reply_markup=reply_markup,
         disable_web_page_preview=True
     )
+
 
 # Invio file guida alle selezioni
 @router.message(Command("selezioni"))
@@ -1155,70 +1129,8 @@ def scrape_all_pages_http():
         session.close()
 
 
-def scrape_all_pages_selenium():
-    """Fallback: Chrome scarica tutto l'HTML, poi viene chiuso."""
-    logger.warning("Fallback a Selenium per la lista annunci.")
-    driver = None
-    try:
-        driver = create_chrome_driver()
-        main_html = load_page_source(
-            driver,
-            DOMAIN + "jobs.php",
-            wait_locators=[
-                (By.CLASS_NAME, "searchResultsBody"),
-                (By.CLASS_NAME, "singleResult")
-            ]
-        )
-
-        jobs_data = parse_jobs_list_html(main_html)
-        return jobs_data, "selenium"
-    finally:
-        close_driver_quietly(driver)
-
-
 def scrape_all_pages():
-    try:
-        return scrape_all_pages_http()
-    except Exception as e:
-        logger.warning("HTTP scraping lista fallito, fallback a Selenium: %s", e)
-        return scrape_all_pages_selenium()
-
-
-def scrape_detail_pages_selenium(job_urls):
-    """Fallback: apre Chrome solo per le pagine dettaglio dei job NUOVI."""
-    detail_htmls = {}
-    if not job_urls:
-        return detail_htmls, {
-            "detail_source": "selenium",
-            "requested": 0,
-            "loaded": 0
-        }
-
-    logger.warning("Fallback a Selenium per %s pagine dettaglio.", len(job_urls))
-    driver = None
-    try:
-        for url in job_urls:
-            for attempt in range(1, 3):
-                try:
-                    if driver is None:
-                        driver = create_chrome_driver()
-                    detail_htmls[url] = load_page_source(driver, url)
-                    break
-                except (TimeoutException, WebDriverException) as e:
-                    logger.warning("Tentativo %s/2 Selenium fallito per il dettaglio %s: %s", attempt, url, e)
-                    close_driver_quietly(driver)
-                    driver = None
-                    if attempt == 2:
-                        detail_htmls[url] = None
-    finally:
-        close_driver_quietly(driver)
-
-    loaded_count = sum(1 for html in detail_htmls.values() if html)
-    return detail_htmls, {
-        "detail_source": "selenium",
-        "requested": len(job_urls),
-        "loaded": loaded_count
-    }
+    return scrape_all_pages_http()
 
 
 def scrape_detail_pages_http(job_urls):
@@ -1231,7 +1143,6 @@ def scrape_detail_pages_http(job_urls):
         }
 
     session = create_http_session()
-    fallback_urls = []
     try:
         for url in job_urls:
             for attempt in range(1, 3):
@@ -1244,34 +1155,85 @@ def scrape_detail_pages_http(job_urls):
                 except Exception as e:
                     logger.warning("Tentativo %s/2 HTTP fallito per il dettaglio %s: %s", attempt, url, e)
                     if attempt == 2:
-                        fallback_urls.append(url)
-
-        if fallback_urls:
-            logger.warning("Fallback Selenium per %s pagine dettaglio.", len(fallback_urls))
-            fallback_htmls, _ = scrape_detail_pages_selenium(fallback_urls)
-            detail_htmls.update(fallback_htmls)
+                        detail_htmls[url] = None
     finally:
         session.close()
 
     loaded_count = sum(1 for html in detail_htmls.values() if html)
-    detail_source = "mixed" if fallback_urls else "http"
     return detail_htmls, {
-        "detail_source": detail_source,
+        "detail_source": "http",
         "requested": len(job_urls),
         "loaded": loaded_count
     }
 
 
 def scrape_detail_pages(job_urls):
+    return scrape_detail_pages_http(job_urls)
+
+
+def verify_missing_jobs_http(job_rows):
+    verified_removed_ids = []
+    kept_ids = []
+    error_ids = []
+    if not job_rows:
+        return verified_removed_ids, {
+            "checked": 0,
+            "kept": 0,
+            "errors": 0
+        }
+
+    session = create_http_session()
     try:
-        return scrape_detail_pages_http(job_urls)
-    except Exception as e:
-        logger.warning("HTTP scraping dettagli fallito, fallback a Selenium: %s", e)
-        return scrape_detail_pages_selenium(job_urls)
+        for job in job_rows:
+            try:
+                detail_html = fetch_page_source_http(session, job["url"])
+                if is_valid_detail_html(detail_html):
+                    kept_ids.append(job["id"])
+                else:
+                    logger.info(
+                        "CLEAN_DETAIL_INVALID JOB_ID=%s JOB_TITLE=%s",
+                        job["id"],
+                        job["title"]
+                    )
+                    verified_removed_ids.append(job["id"])
+            except req_http.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code in {404, 410}:
+                    logger.info(
+                        "CLEAN_DETAIL_GONE JOB_ID=%s HTTP_STATUS=%s JOB_TITLE=%s",
+                        job["id"],
+                        status_code,
+                        job["title"]
+                    )
+                    verified_removed_ids.append(job["id"])
+                else:
+                    logger.warning(
+                        "Clean verifica dettaglio fallita per job %s (%s): %s",
+                        job["id"],
+                        job["title"],
+                        exc
+                    )
+                    error_ids.append(job["id"])
+            except Exception as exc:
+                logger.warning(
+                    "Clean verifica dettaglio fallita per job %s (%s): %s",
+                    job["id"],
+                    job["title"],
+                    exc
+                )
+                error_ids.append(job["id"])
+    finally:
+        session.close()
+
+    return verified_removed_ids, {
+        "checked": len(job_rows),
+        "kept": len(kept_ids),
+        "errors": len(error_ids)
+    }
 
 
 async def scraping():
-    # Fase 1: scarica la lista job via HTTP, con fallback Selenium se serve.
+    # Fase 1: scarica la lista job via HTTP.
     started_at = time.monotonic()
     list_source = "unknown"
     for attempt in range(1, 4):
@@ -1286,8 +1248,6 @@ async def scraping():
                 logger.error("SCRAPE_STATUS=failed LIST_SOURCE=%s reason=list_fetch_failed", list_source)
                 await notify_admin_error("scraping: pagina principale non caricata dopo 3 tentativi")
                 return
-
-    # Chrome è già chiuso qui - memoria libera
 
     if not jobs_data:
         logger.warning(
@@ -1340,7 +1300,7 @@ async def scraping():
                 logger.warning("Errore processando annuncio %s: %s", job.get('id', '?'), e)
                 continue
 
-        # Fase 3: solo per i job nuovi, prova HTTP e usa Selenium solo in fallback.
+        # Fase 3: solo per i job nuovi, carica i dettagli via HTTP.
         if new_jobs:
             new_urls = [j['url'] for j in new_jobs]
             detail_htmls, detail_stats = await asyncio.to_thread(scrape_detail_pages, new_urls)
@@ -1472,19 +1432,32 @@ async def clean():
 
     active_job_ids = {job["id"] for job in jobs_data}
 
+    verify_stats = {
+        "checked": 0,
+        "kept": 0,
+        "errors": 0
+    }
     async with db_pool.acquire() as conn:
-        jobs = await conn.fetch("SELECT id FROM jobs")
-        delete_list = [job["id"] for job in jobs if job["id"] not in active_job_ids]
+        jobs = await conn.fetch("SELECT id, url, title FROM jobs")
+        missing_jobs = [
+            {"id": job["id"], "url": job["url"], "title": job["title"]}
+            for job in jobs
+            if job["id"] not in active_job_ids
+        ]
+        delete_list, verify_stats = await asyncio.to_thread(verify_missing_jobs_http, missing_jobs)
 
         if delete_list:
             await conn.execute("DELETE FROM favorites WHERE idJob = ANY($1)", delete_list)
             await conn.execute("DELETE FROM jobs WHERE id = ANY($1)", delete_list)
 
     logger.info(
-        "CLEAN_STATUS=ok LIST_SOURCE=%s LIST_COUNT=%s REMOVED=%s DURATION=%.2fs",
+        "CLEAN_STATUS=ok LIST_SOURCE=%s LIST_COUNT=%s VERIFY_CHECKED=%s REMOVED=%s KEPT=%s VERIFY_ERRORS=%s DURATION=%.2fs",
         list_source,
         len(jobs_data),
+        verify_stats["checked"],
         len(delete_list),
+        verify_stats["kept"],
+        verify_stats["errors"],
         time.monotonic() - started_at
     )
 
