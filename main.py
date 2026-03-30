@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from keep_alive import keep_alive
 import asyncpg
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 import requests as req_http
 import gc
 
@@ -34,9 +35,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ferrovie")
 
+
+def env_int(name, default, minimum=None):
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        value = default
+    else:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            logger.warning("Valore non valido per %s=%r. Uso %s.", name, raw_value, default)
+            value = default
+
+    if minimum is not None and value < minimum:
+        logger.warning("Valore troppo basso per %s=%s. Uso %s.", name, value, minimum)
+        value = minimum
+
+    return value
+
+
 LANG_COOKIE = {"name": "lang", "value": "it_IT"}
-HTTP_TIMEOUT = 30
-TELEGRAPH_TIMEOUT = 15
+HTTP_TIMEOUT = env_int("HTTP_TIMEOUT", 30, minimum=1)
+TELEGRAPH_TIMEOUT = env_int("TELEGRAPH_TIMEOUT", 15, minimum=1)
+SCRAPE_START_DELAY_SECONDS = env_int("SCRAPE_START_DELAY_SECONDS", 5, minimum=0)
+LIST_PAGE_LIMIT = env_int("LIST_PAGE_LIMIT", 5, minimum=1)
 HTTP_HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9",
     "User-Agent": (
@@ -73,21 +95,48 @@ class TimeoutSession(req_http.Session):
 
 
 def create_http_session():
+    return create_http_session_with_lang_cookie(LANG_COOKIE["value"])
+
+
+def create_http_session_with_lang_cookie(lang_cookie_value=None):
     session = req_http.Session()
     session.headers.update(HTTP_HEADERS)
-    session.cookies.set(LANG_COOKIE["name"], LANG_COOKIE["value"])
+    if lang_cookie_value is not None:
+        session.cookies.set(LANG_COOKIE["name"], lang_cookie_value)
     return session
 
 
 def with_source_param(url, source="Bot"):
     parts = urlsplit(url)
     query_params = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "source"]
-    query_params.append(("source", source))
+    if source is not None:
+        query_params.append(("source", source))
     return urlunsplit(parts._replace(query=urlencode(query_params, doseq=True)))
 
 
 def fetch_page_source_http(session, url):
     response = session.get(with_source_param(url), timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+    return response.text
+
+
+def with_cache_bust(url):
+    parts = urlsplit(url)
+    query_params = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "_t"]
+    query_params.append(("_t", str(int(time.time()))))
+    return urlunsplit(parts._replace(query=urlencode(query_params, doseq=True)))
+
+
+def fetch_page_source_http_with_options(session, url, source="Bot"):
+    response = session.get(
+        with_cache_bust(with_source_param(url, source=source)),
+        timeout=HTTP_TIMEOUT,
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+    )
     response.raise_for_status()
     response.encoding = response.apparent_encoding or response.encoding or "utf-8"
     return response.text
@@ -102,6 +151,158 @@ def get_result_cards(results_container):
         "div",
         class_=lambda value: value and "singleResult" in value
     )
+
+
+def normalize_whitespace(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
+
+
+def normalize_label(value):
+    return normalize_whitespace(value).rstrip(":").lower()
+
+
+def extract_job_href(result, details):
+    title_node = details.find("h3") if details else None
+    if title_node is not None:
+        title_link = title_node.find_parent("a")
+        if title_link and title_link.get("href"):
+            return title_link["href"]
+
+    for container in (details, result):
+        if container is None:
+            continue
+        for link in container.find_all("a", href=True):
+            href = normalize_whitespace(link.get("href"))
+            if href and "id=" in href:
+                return href
+
+    return None
+
+
+def extract_field_from_table(details, label):
+    wanted_label = label.lower()
+    for text_node in details.find_all(string=True):
+        if normalize_label(text_node) != wanted_label:
+            continue
+
+        parent = getattr(text_node, "parent", None)
+        td = parent.find_parent("td") if parent else None
+        if td is not None:
+            next_td = td.find_next_sibling("td")
+            if next_td is not None:
+                value = normalize_whitespace(next_td.get_text(" ", strip=True))
+                if value:
+                    return value
+
+        if parent is not None:
+            parent_text = normalize_whitespace(parent.get_text(" ", strip=True))
+            match = re.search(rf"{re.escape(label)}\s*:?\s*(.+)$", parent_text, flags=re.IGNORECASE)
+            if match:
+                value = normalize_whitespace(match.group(1))
+                if value and normalize_label(value) != wanted_label:
+                    return value
+
+    return None
+
+
+def extract_field_from_lines(details, label):
+    lines = [
+        normalize_whitespace(line)
+        for line in details.get_text("\n", strip=True).splitlines()
+        if normalize_whitespace(line)
+    ]
+    label_prefix = f"{label.lower()}:"
+    all_labels = {"sede", "settore", "ruolo"}
+
+    for index, line in enumerate(lines):
+        lower_line = line.lower()
+        if not lower_line.startswith(label_prefix):
+            continue
+
+        inline_value = normalize_whitespace(line.split(":", 1)[1])
+        if inline_value:
+            return inline_value
+
+        collected = []
+        for next_line in lines[index + 1:]:
+            normalized_next = normalize_whitespace(next_line)
+            if not normalized_next:
+                continue
+
+            next_label = normalize_label(normalized_next)
+            if next_label in all_labels or re.fullmatch(r"\d{2}/\d{2}/\d{4}", normalized_next):
+                break
+
+            collected.append(normalized_next)
+            if label != "Sede":
+                break
+            if len(collected) >= 3:
+                break
+
+        value = normalize_whitespace(" ".join(collected))
+        if value:
+            return value
+
+    return None
+
+
+def extract_job_field(details, label, default_value):
+    value = extract_field_from_table(details, label)
+    if not value:
+        value = extract_field_from_lines(details, label)
+    return value or default_value
+
+
+def extract_job_date(details):
+    date_node = details.find("span", {"class": "date"})
+    if date_node is not None:
+        date_value = normalize_whitespace(date_node.get_text(" ", strip=True))
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", date_value):
+            return date_value
+
+    all_dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", details.get_text(" ", strip=True))
+    if all_dates:
+        return all_dates[-1]
+
+    return None
+
+
+def get_pagination_urls(soup, current_url):
+    pagination_urls = []
+    seen = set()
+
+    for link in soup.find_all("a", href=True):
+        href = normalize_whitespace(link.get("href"))
+        text = normalize_whitespace(link.get_text(" ", strip=True)).lower()
+        rel = " ".join(link.get("rel", [])).lower()
+        classes = " ".join(link.get("class", [])).lower()
+
+        if not href:
+            continue
+
+        absolute_url = url_normalize(urljoin(current_url, href))
+        if "jobs.php" not in absolute_url:
+            continue
+
+        if absolute_url == url_normalize(current_url) or absolute_url in seen:
+            continue
+
+        is_pagination_link = (
+            text.isdigit() or
+            "pagina successiva" in text or
+            "successiva" in text or
+            rel == "next" or
+            "next" in classes or
+            "pagination" in classes
+        )
+
+        if is_pagination_link:
+            pagination_urls.append(absolute_url)
+            seen.add(absolute_url)
+
+    return pagination_urls
 
 
 def get_description_node(soup):
@@ -131,24 +332,31 @@ def parse_jobs_list_html(main_html):
 
     results = get_result_cards(results_container)
     jobs_data = []
-    for result in results:
+    skipped_cards = 0
+    for card_index, result in enumerate(results, start=1):
         try:
-            details = result.find("div", {"class": "details"})
-            jobUrl = url_normalize(DOMAIN + details.find("a")["href"])
-            jobTitle = details.find("h3").text.strip()
+            details = result.find("div", {"class": "details"}) or result
+            job_href = extract_job_href(result, details)
+            if not job_href:
+                raise ValueError("URL annuncio non trovato")
 
-            lista_posizione = [
-                span.text.strip().title() for span in details.find_next(
-                    string="Sede:").find_next("td").find_next("span").find_all("span")
-                if span.text.strip()
-            ]
-            jobZone = ' , '.join(lista_posizione)
-            jobSector = details.find_next(string="Settore:").find_next("span").text
-            jobRole = details.find_next(string="Ruolo:").find_next("span").text
-            jobDate = details.find("span", {"class": "date"}).text
+            jobUrl = url_normalize(urljoin(DOMAIN, job_href))
+            title_node = details.find("h3") or result.find("h3")
+            if title_node is None:
+                raise ValueError("Titolo annuncio non trovato")
+
+            jobTitle = normalize_whitespace(title_node.get_text(" ", strip=True))
+            jobZone = extract_job_field(details, "Sede", "Non specificata")
+            jobSector = extract_job_field(details, "Settore", "Non specificato")
+            jobRole = extract_job_field(details, "Ruolo", "Non specificato")
+            jobDate = extract_job_date(details)
+            if not jobDate:
+                raise ValueError("Data annuncio non trovata")
 
             parsed_url = urlparse(jobUrl)
             params = parse_qs(parsed_url.query)
+            if "id" not in params or not params["id"]:
+                raise ValueError("ID annuncio non trovato nell'URL")
             jobID = int(params['id'][0])
 
             jobs_data.append({
@@ -157,10 +365,42 @@ def parse_jobs_list_html(main_html):
                 'date': jobDate, 'description_html': None
             })
         except Exception as e:
-            logger.warning("Errore parsing annuncio dalla lista: %s", e)
+            skipped_cards += 1
+            card_preview = normalize_whitespace(result.get_text(" ", strip=True))[:220]
+            logger.warning(
+                "Errore parsing annuncio dalla lista card=%s: %s | PREVIEW=%s",
+                card_index,
+                e,
+                card_preview
+            )
             continue
 
+    logger.info(
+        "LIST_PARSE_SUMMARY TOTAL_CARDS=%s PARSED=%s SKIPPED=%s",
+        len(results),
+        len(jobs_data),
+        skipped_cards
+    )
     return jobs_data
+
+
+def job_sort_key(job):
+    try:
+        job_date = datetime.strptime(job["date"], "%d/%m/%Y")
+    except Exception:
+        job_date = datetime.min
+    return job_date, int(job["id"])
+
+
+def merge_jobs_lists(job_lists):
+    merged_jobs = {}
+    for jobs_data in job_lists:
+        for job in jobs_data:
+            existing_job = merged_jobs.get(job["id"])
+            if existing_job is None or job_sort_key(job) > job_sort_key(existing_job):
+                merged_jobs[job["id"]] = job
+
+    return sorted(merged_jobs.values(), key=job_sort_key, reverse=True)
 
 
 def is_valid_detail_html(detail_html):
@@ -244,6 +484,7 @@ except Exception as e:
     logger.warning("Telegraph create_account fallito all'avvio: %s", e)
 
 lock = asyncio.Lock()
+background_tasks = set()
 db_pool: asyncpg.Pool = None
 
 bot = Bot(token=os.environ['bot_token'], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -350,6 +591,13 @@ def build_channel_message_text(job, deadline=None, header="\U0001F686 <b>Nuovo a
 \U0001F4C5 <i>Data di pubblicazione: {publication_date}</i>{deadline_line}"""
 
 
+def create_background_task(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
+
 def fetch_latest_job_snapshot():
     jobs_data, list_source = scrape_all_pages()
     if not jobs_data:
@@ -396,6 +644,33 @@ async def create_telegraph_page_url(title, html_content, retries=3):
 
     logger.error("Telegraph non disponibile per '%s'. Ultimo errore: %s", title, last_error)
     return None
+
+
+async def enrich_channel_message(job, message_id, message_url, description_html):
+    started_at = time.monotonic()
+    try:
+        telegraph_url = await create_telegraph_page_url(job["title"], description_html)
+        description_url = telegraph_url or job["url"]
+        reply_markup = build_channel_job_buttons(
+            description_url,
+            job["id"],
+            message_url,
+            job["title"]
+        )
+        await bot.edit_message_reply_markup(
+            chat_id=CHAT_ID,
+            message_id=message_id,
+            reply_markup=reply_markup
+        )
+        logger.info(
+            "CHANNEL_ENRICH JOB_ID=%s MESSAGE_ID=%s DESCRIPTION_SOURCE=%s ELAPSED=%.2fs",
+            job["id"],
+            message_id,
+            "telegraph" if telegraph_url else "job_url",
+            time.monotonic() - started_at
+        )
+    except Exception:
+        logger.exception("Errore aggiornando i pulsanti del messaggio canale per job %s", job["id"])
 
 
 start_message = """Ciao! Questo \u00E8 un bot <b>non ufficiale</b> delle <b>Ferrovie Dello Stato</b> \U0001F686
@@ -1111,22 +1386,130 @@ async def elimina(message: Message):
 
 
 # Scraping
-def scrape_all_pages_http():
-    session = create_http_session()
+def get_list_fetch_variants():
+    return (
+        {
+            "label": "http_it_no_source",
+            "url": url_normalize(DOMAIN + "jobs.php?language=it"),
+            "source": None,
+            "lang_cookie": "it"
+        },
+        {
+            "label": "http_it_source_bot",
+            "url": url_normalize(DOMAIN + "jobs.php?language=it"),
+            "source": "Bot",
+            "lang_cookie": "it"
+        },
+        {
+            "label": "http_it_it_no_source",
+            "url": url_normalize(DOMAIN + "jobs.php?language=it_IT"),
+            "source": None,
+            "lang_cookie": "it_IT"
+        },
+        {
+            "label": "http_it_it_source_bot",
+            "url": url_normalize(DOMAIN + "jobs.php?language=it_IT"),
+            "source": "Bot",
+            "lang_cookie": "it_IT"
+        }
+    )
+
+
+def fetch_jobs_list_variant_http(variant):
+    session = create_http_session_with_lang_cookie(variant["lang_cookie"])
     try:
-        main_html = fetch_page_source_http(session, url_normalize(DOMAIN + "jobs.php?language=it_IT"))
-        jobs_data = parse_jobs_list_html(main_html)
+        urls_to_visit = [variant["url"]]
+        visited_urls = set()
+        all_jobs_data = []
+
+        while urls_to_visit and len(visited_urls) < LIST_PAGE_LIMIT:
+            current_url = urls_to_visit.pop(0)
+            normalized_current_url = url_normalize(current_url)
+            if normalized_current_url in visited_urls:
+                continue
+
+            main_html = fetch_page_source_http_with_options(
+                session,
+                current_url,
+                source=variant["source"]
+            )
+            soup = BeautifulSoup(main_html, "lxml")
+            jobs_data = parse_jobs_list_html(main_html)
+            all_jobs_data.append(jobs_data)
+            visited_urls.add(normalized_current_url)
+
+            for next_page_url in get_pagination_urls(soup, current_url):
+                normalized_next_url = url_normalize(next_page_url)
+                if normalized_next_url not in visited_urls and normalized_next_url not in urls_to_visit:
+                    urls_to_visit.append(normalized_next_url)
+
+        jobs_data = merge_jobs_lists(all_jobs_data)
         if jobs_data:
             top_job = jobs_data[0]
             logger.info(
-                "HTTP_TOP_JOB_ID=%s HTTP_TOP_JOB_DATE=%s HTTP_TOP_JOB_TITLE=%s",
+                "LIST_VARIANT=%s COUNT=%s PAGES=%s TOP_JOB_ID=%s TOP_JOB_DATE=%s TOP_JOB_TITLE=%s",
+                variant["label"],
+                len(jobs_data),
+                len(visited_urls),
                 top_job["id"],
                 top_job["date"],
                 top_job["title"]
             )
-        return jobs_data, "http"
+        else:
+            logger.info("LIST_VARIANT=%s COUNT=0 PAGES=%s", variant["label"], len(visited_urls))
+        return {
+            "label": variant["label"],
+            "jobs_data": jobs_data
+        }
     finally:
         session.close()
+
+
+def scrape_all_pages_http():
+    variants = get_list_fetch_variants()
+    variant_results = []
+    errors = []
+
+    with ThreadPoolExecutor(max_workers=len(variants)) as executor:
+        future_to_variant = {
+            executor.submit(fetch_jobs_list_variant_http, variant): variant
+            for variant in variants
+        }
+        for future in as_completed(future_to_variant):
+            variant = future_to_variant[future]
+            try:
+                variant_results.append(future.result())
+            except Exception as exc:
+                logger.warning("Fetch lista fallito per variante %s: %s", variant["label"], exc)
+                errors.append((variant["label"], exc))
+
+    if not variant_results:
+        if errors:
+            raise RuntimeError(
+                "Tutte le varianti lista hanno fallito: "
+                + ", ".join(f"{label}={exc}" for label, exc in errors)
+            )
+        raise RuntimeError("Nessuna variante lista disponibile")
+
+    top_ids_by_variant = {
+        result["label"]: result["jobs_data"][0]["id"]
+        for result in variant_results
+        if result["jobs_data"]
+    }
+    if len(set(top_ids_by_variant.values())) > 1:
+        logger.warning("LIST_VARIANTS_DIVERGE TOP_IDS=%s", top_ids_by_variant)
+
+    jobs_data = merge_jobs_lists([result["jobs_data"] for result in variant_results])
+    if jobs_data:
+        top_job = jobs_data[0]
+        logger.info(
+            "HTTP_TOP_JOB_ID=%s HTTP_TOP_JOB_DATE=%s HTTP_TOP_JOB_TITLE=%s HTTP_VARIANTS_OK=%s",
+            top_job["id"],
+            top_job["date"],
+            top_job["title"],
+            ",".join(sorted(result["label"] for result in variant_results))
+        )
+    return jobs_data, "http_multi"
 
 
 def scrape_all_pages():
@@ -1304,9 +1687,27 @@ async def scraping():
         if new_jobs:
             new_urls = [j['url'] for j in new_jobs]
             detail_htmls, detail_stats = await asyncio.to_thread(scrape_detail_pages, new_urls)
+            users = await conn.fetch("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
+            user_ids = [u['iduser'] for u in users]
+            sectors_by_user = {}
+            zones_by_user = {}
+            if user_ids:
+                user_sectors_rows = await conn.fetch(
+                    "SELECT idUser, type FROM sectors WHERE idUser = ANY($1)",
+                    user_ids
+                )
+                user_zones_rows = await conn.fetch(
+                    "SELECT idUser, zone FROM zones WHERE idUser = ANY($1)",
+                    user_ids
+                )
+                for row in user_sectors_rows:
+                    sectors_by_user.setdefault(row['iduser'], []).append(row['type'])
+                for row in user_zones_rows:
+                    zones_by_user.setdefault(row['iduser'], []).append(row['zone'])
 
             for job in new_jobs:
                 try:
+                    job_started_at = time.monotonic()
                     detail_html = detail_htmls.get(job['url'])
                     detail_data = extract_job_detail_data(detail_html) if detail_html else None
                     if detail_data is None:
@@ -1314,12 +1715,13 @@ async def scraping():
                         continue
 
                     dateDB = datetime.strptime(job['date'], '%d/%m/%Y').date()
-                    telegraph_url = await create_telegraph_page_url(job['title'], detail_data['description_html'])
-                    if not telegraph_url:
-                        logger.warning("Telegraph non disponibile per job %s, annuncio saltato.", job['id'])
-                        continue
-
-                    channel_buttons = build_channel_job_buttons(telegraph_url, job['id']).inline_keyboard
+                    logger.info(
+                        "NEW_JOB_DETECTED JOB_ID=%s JOB_DATE=%s JOB_TITLE=%s",
+                        job['id'],
+                        job['date'],
+                        job['title']
+                    )
+                    channel_buttons = build_channel_job_buttons(job['url'], job['id']).inline_keyboard
                     channel_message_text = build_channel_message_text(job, detail_data.get('deadline'))
                     sent_message = await bot.send_message(
                         CHAT_ID,
@@ -1327,14 +1729,20 @@ async def scraping():
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=channel_buttons),
                         disable_web_page_preview=True
                     )
+                    logger.info(
+                        "CHANNEL_MESSAGE_SENT JOB_ID=%s MESSAGE_ID=%s ELAPSED=%.2fs DESCRIPTION_SOURCE=job_url",
+                        job['id'],
+                        sent_message.message_id,
+                        time.monotonic() - job_started_at
+                    )
 
-                    channel_buttons = build_channel_job_buttons(
-                        telegraph_url, job['id'], sent_message.get_url(), job['title']
-                    ).inline_keyboard
-                    message_edited = await bot.edit_message_reply_markup(
-                        chat_id=CHAT_ID,
-                        message_id=sent_message.message_id,
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=channel_buttons)
+                    create_background_task(
+                        enrich_channel_message(
+                            job,
+                            sent_message.message_id,
+                            sent_message.get_url(),
+                            detail_data['description_html']
+                        )
                     )
 
                     await conn.execute(
@@ -1343,26 +1751,8 @@ async def scraping():
                         sent_message.message_id)
                     sent_new_jobs += 1
 
-                    users = await conn.fetch("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
-                    user_ids = [u['iduser'] for u in users]
-                    sectors_by_user = {}
-                    zones_by_user = {}
-                    if user_ids:
-                        user_sectors_rows = await conn.fetch(
-                            "SELECT idUser, type FROM sectors WHERE idUser = ANY($1)",
-                            user_ids
-                        )
-                        user_zones_rows = await conn.fetch(
-                            "SELECT idUser, zone FROM zones WHERE idUser = ANY($1)",
-                            user_ids
-                        )
-                        for row in user_sectors_rows:
-                            sectors_by_user.setdefault(row['iduser'], []).append(row['type'])
-                        for row in user_zones_rows:
-                            zones_by_user.setdefault(row['iduser'], []).append(row['zone'])
-
                     # Notifiche in parallelo
-                    async def notify_user(user_id, _job=job, _msg=message_edited):
+                    async def notify_user(user_id, _job=job, _message_id=sent_message.message_id):
                         user_sectors = sectors_by_user.get(user_id, [])
                         user_zones = zones_by_user.get(user_id, [])
 
@@ -1383,7 +1773,7 @@ async def scraping():
                             try:
                                 await bot.forward_message(chat_id=user_id,
                                                           from_chat_id=CHAT_ID,
-                                                          message_id=_msg.message_id)
+                                                          message_id=_message_id)
                             except Exception:
                                 users_blocked.append(user_id)
 
@@ -1485,7 +1875,19 @@ async def main():
 
     scheduler = AsyncIOScheduler(timezone="Europe/Rome")
     scheduler.add_job(safe_clean, "cron", hour=1, misfire_grace_time=300)
-    scheduler.add_job(safe_scraping, "interval", minutes=1, next_run_time=datetime.now() + timedelta(seconds=10))
+    scheduler.add_job(
+        safe_scraping,
+        "interval",
+        minutes=5,
+        next_run_time=datetime.now() + timedelta(seconds=SCRAPE_START_DELAY_SECONDS),
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300
+    )
+    logger.info(
+        "Scheduler scraping attivo ogni 5 minuti con start delay %ss",
+        SCRAPE_START_DELAY_SECONDS
+    )
     scheduler.start()
 
     keep_alive()
