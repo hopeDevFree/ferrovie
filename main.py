@@ -61,6 +61,7 @@ SCRAPE_START_DELAY_SECONDS = env_int("SCRAPE_START_DELAY_SECONDS", 5, minimum=0)
 LIST_PAGE_LIMIT = env_int("LIST_PAGE_LIMIT", 5, minimum=1)
 HTTP_HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9",
+    "Referer": "https://fscareers.gruppofs.it/",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -362,7 +363,8 @@ def parse_jobs_list_html(main_html):
             jobs_data.append({
                 'id': jobID, 'url': jobUrl, 'title': jobTitle,
                 'zone': jobZone, 'sector': jobSector, 'role': jobRole,
-                'date': jobDate, 'description_html': None
+                'date': jobDate, 'description_html': None,
+                'list_position': card_index
             })
         except Exception as e:
             skipped_cards += 1
@@ -389,7 +391,7 @@ def job_sort_key(job):
         job_date = datetime.strptime(job["date"], "%d/%m/%Y")
     except Exception:
         job_date = datetime.min
-    return job_date, int(job["id"])
+    return job_date, -job.get("list_position", 9999)
 
 
 def merge_jobs_lists(job_lists):
@@ -599,12 +601,12 @@ def create_background_task(coro):
 
 
 def fetch_latest_job_snapshot():
-    jobs_data, list_source = scrape_all_pages()
+    jobs_data, list_source = scrape_all_pages_http()
     if not jobs_data:
         raise ValueError("Nessun annuncio trovato sul sito")
 
     latest_job = jobs_data[0]
-    detail_htmls, _ = scrape_detail_pages([latest_job["url"]])
+    detail_htmls, _ = scrape_detail_pages_http([latest_job["url"]])
     detail_html = detail_htmls.get(latest_job["url"])
     detail_data = extract_job_detail_data(detail_html) if detail_html else None
 
@@ -1389,10 +1391,16 @@ async def elimina(message: Message):
 def get_list_fetch_variants():
     return (
         {
-            "label": "http_it_no_source",
-            "url": url_normalize(DOMAIN + "jobs.php?language=it"),
+            "label": "ajax_it",
+            "url": url_normalize(DOMAIN + "ajax/common/ajax_searchIframe.php?language=it&search=1"),
             "source": None,
             "lang_cookie": "it"
+        },
+        {
+            "label": "ajax_it_it",
+            "url": url_normalize(DOMAIN + "ajax/common/ajax_searchIframe.php?language=it_IT&search=1"),
+            "source": None,
+            "lang_cookie": "it_IT"
         },
         {
             "label": "http_it_source_bot",
@@ -1400,18 +1408,6 @@ def get_list_fetch_variants():
             "source": "Bot",
             "lang_cookie": "it"
         },
-        {
-            "label": "http_it_it_no_source",
-            "url": url_normalize(DOMAIN + "jobs.php?language=it_IT"),
-            "source": None,
-            "lang_cookie": "it_IT"
-        },
-        {
-            "label": "http_it_it_source_bot",
-            "url": url_normalize(DOMAIN + "jobs.php?language=it_IT"),
-            "source": "Bot",
-            "lang_cookie": "it_IT"
-        }
     )
 
 
@@ -1512,10 +1508,6 @@ def scrape_all_pages_http():
     return jobs_data, "http_multi"
 
 
-def scrape_all_pages():
-    return scrape_all_pages_http()
-
-
 def scrape_detail_pages_http(job_urls):
     detail_htmls = {}
     if not job_urls:
@@ -1549,9 +1541,6 @@ def scrape_detail_pages_http(job_urls):
         "loaded": loaded_count
     }
 
-
-def scrape_detail_pages(job_urls):
-    return scrape_detail_pages_http(job_urls)
 
 
 def verify_missing_jobs_http(job_rows):
@@ -1621,7 +1610,7 @@ async def scraping():
     list_source = "unknown"
     for attempt in range(1, 4):
         try:
-            jobs_data, list_source = await asyncio.to_thread(scrape_all_pages)
+            jobs_data, list_source = await asyncio.to_thread(scrape_all_pages_http)
             break
         except Exception as e:
             logger.warning("Tentativo %s/3 fallito per caricare la pagina principale: %s", attempt, e)
@@ -1686,7 +1675,7 @@ async def scraping():
         # Fase 3: solo per i job nuovi, carica i dettagli via HTTP.
         if new_jobs:
             new_urls = [j['url'] for j in new_jobs]
-            detail_htmls, detail_stats = await asyncio.to_thread(scrape_detail_pages, new_urls)
+            detail_htmls, detail_stats = await asyncio.to_thread(scrape_detail_pages_http, new_urls)
             users = await conn.fetch("SELECT idUser FROM notifications WHERE type = 'Nuovo'")
             user_ids = [u['iduser'] for u in users]
             sectors_by_user = {}
@@ -1811,7 +1800,7 @@ async def scraping():
 async def clean():
     started_at = time.monotonic()
     try:
-        jobs_data, list_source = await asyncio.to_thread(scrape_all_pages)
+        jobs_data, list_source = await asyncio.to_thread(scrape_all_pages_http)
     except Exception as e:
         logger.warning("Clean saltato: impossibile caricare la lista annunci: %s", e)
         return
